@@ -62,7 +62,7 @@ kafka-5o:
 
 kafka-5a:
      cargo build --bin kafka
-     ./maelstrom test -w kafka --bin ./target/debug/kafka --node-count 1  --concurrency 2n --rate 100 --time-limit 10
+     ./maelstrom test -w kafka --bin ./target/debug/kafka --node-count 1  --concurrency 2n --rate 1000 --time-limit 20
 
 
 
