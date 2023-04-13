@@ -4,7 +4,7 @@ use eyre::{eyre, Result};
 use opentelemetry::propagation::Injector;
 use serde::{de::DeserializeOwned, Serialize};
 use smol_str::SmolStr;
-use tokio::{select, sync::mpsc};
+use tokio::{select, sync::mpsc, task::JoinHandle};
 use tracing::{info_span, instrument, Span};
 
 mod mailbox;
@@ -40,7 +40,7 @@ where
         tracing::debug!(request = ?req, "Sending request");
         let rv = self.mailbox.send(req);
 
-        match tokio::time::timeout(Duration::from_millis(50), rv).await {
+        match tokio::time::timeout(Duration::from_millis(250), rv).await {
             Ok(Ok(res)) => Ok(res),
             Ok(Err(er)) => {
                 tracing::error!(?er, "Could not receive response");
@@ -164,4 +164,25 @@ fn inject_trace<R>(message: &mut Message<Request<R>>) {
     opentelemetry::global::get_text_map_propagator(|prop| {
         prop.inject_context(&tracing::Span::current().context(), &mut inj)
     });
+}
+
+pub fn periodic_injection<R, I>(
+    channel: mpsc::Sender<Event<R, I>>,
+    period: Duration,
+    injection: I,
+) -> JoinHandle<()>
+where
+    R: Send + 'static,
+    I: Sync + Send + Clone + 'static,
+{
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        loop {
+            interval.tick().await;
+            if let Err(_) = channel.send(Event::Injected(injection.clone())).await {
+                tracing::error!("Channel closed");
+                break;
+            }
+        }
+    })
 }

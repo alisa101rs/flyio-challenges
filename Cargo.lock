@@ -249,6 +249,7 @@ dependencies = [
  "derivative",
  "derive_more",
  "eyre",
+ "fnv",
  "futures",
  "opentelemetry",
  "opentelemetry-otlp",

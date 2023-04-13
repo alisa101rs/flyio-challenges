@@ -8,8 +8,7 @@ use std::{
 
 use eyre::eyre;
 use flyio_rs::{
-    azync::{event_loop, Event, Node, Rpc},
-    setup_with_telemetry, Message, Request,
+    azync::{event_loop, Event, Node, Rpc}, Message, Request,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -17,7 +16,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
-use tracing::{info_span, instrument, Instrument};
+use tracing::{info_span, instrument, Instrument, Span};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -55,11 +54,11 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct BroadcastNode {
     node_id: SmolStr,
-    seen: Mutex<HashSet<u64>>,
-    known: HashMap<SmolStr, Arc<Mutex<Option<HashSet<u64>>>>>,
+    seen: Arc<Mutex<HashSet<u64>>>,
+    known: Arc<HashMap<SmolStr, Arc<Mutex<Option<HashSet<u64>>>>>>,
 }
 
 impl BroadcastNode {
@@ -147,9 +146,9 @@ impl Node for BroadcastNode {
         node_ids: Vec<SmolStr>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
     ) -> eyre::Result<Self> {
-        setup_with_telemetry(format!("broadcast-{node_id}"))?;
+        //setup_with_telemetry(format!("broadcast-{node_id}"))?;
         tokio::task::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(300));
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
             loop {
                 interval.tick().await;
                 if let Err(_) = tx.send(Event::Injected(Injected::Gossip)).await {
@@ -164,8 +163,8 @@ impl Node for BroadcastNode {
 
         Ok(Self {
             node_id,
-            seen: Mutex::new(Default::default()),
-            known,
+            seen: Arc::new(Mutex::new(Default::default())),
+            known: Arc::new(known),
         })
     }
 
@@ -175,51 +174,60 @@ impl Node for BroadcastNode {
         event: Event<Self::Request, Self::Injected>,
         rpc: &Rpc<Self::Response>,
     ) -> eyre::Result<()> {
-        match event {
-            Event::Injected(Injected::Gossip) => {
-                self.gossip(rpc);
-                Ok(())
-            }
-            Event::Request(message) => {
-                let from = message.src.clone();
-                let response = message.into_reply(|payload| match payload {
-                    RequestPayload::Topology { mut topology } => {
-                        self.topology(
-                            topology
-                                .remove(&self.node_id)
-                                .ok_or(eyre!("topology missing self"))
-                                .unwrap(),
-                        );
-                        ResponsePayload::TopologyOk
-                    }
-                    RequestPayload::Broadcast { message } => {
-                        self.seen.lock().insert(message);
-                        ResponsePayload::BroadcastOk
-                    }
-                    RequestPayload::Read => ResponsePayload::ReadOk {
-                        messages: self.seen.lock().clone(),
-                    },
-                    RequestPayload::Gossip { notify } => {
-                        self.seen.lock().extend(notify.iter());
-                        if let Some(known) = self.known.get(&from) {
-                            if let Some(known) = &mut *known.lock() {
-                                known.extend(notify.iter());
-                                ResponsePayload::GossipOk {
-                                    acknowledged: notify,
-                                }
-                            } else {
-                                panic!("gossip_ok from non-neighbor")
-                            }
-                        } else {
-                            panic!("gossip_ok from non-neighbor")
-                        }
-                    }
-                });
+        let node = self.clone();
+        let rpc = rpc.clone();
+        let span = Span::current();
 
-                rpc.respond(response);
-                Ok(())
+        tokio::task::spawn(
+            async move {
+                match event {
+                    Event::Injected(Injected::Gossip) => {
+                        node.gossip(&rpc);
+                    }
+                    Event::Request(message) => {
+                        let from = message.src.clone();
+                        let response = message.into_reply(|payload| match payload {
+                            RequestPayload::Topology { mut topology } => {
+                                node.topology(
+                                    topology
+                                        .remove(&node.node_id)
+                                        .ok_or(eyre!("topology missing self"))
+                                        .unwrap(),
+                                );
+                                ResponsePayload::TopologyOk
+                            }
+                            RequestPayload::Broadcast { message } => {
+                                node.seen.lock().insert(message);
+                                ResponsePayload::BroadcastOk
+                            }
+                            RequestPayload::Read => ResponsePayload::ReadOk {
+                                messages: node.seen.lock().clone(),
+                            },
+                            RequestPayload::Gossip { notify } => {
+                                node.seen.lock().extend(notify.iter());
+                                if let Some(known) = node.known.get(&from) {
+                                    if let Some(known) = &mut *known.lock() {
+                                        known.extend(notify.iter());
+                                        ResponsePayload::GossipOk {
+                                            acknowledged: notify,
+                                        }
+                                    } else {
+                                        panic!("gossip_ok from non-neighbor")
+                                    }
+                                } else {
+                                    panic!("gossip_ok from non-neighbor")
+                                }
+                            }
+                        });
+
+                        rpc.respond(response);
+                    }
+                    Event::EOF => {}
+                }
             }
-            Event::EOF => Ok(()),
-        }
+            .instrument(span),
+        );
+
+        Ok(())
     }
 }

@@ -44,6 +44,14 @@ broadcast-3c:
     cargo build --bin broadcast_async --release
     ./maelstrom test -w broadcast --bin ./target/release/broadcast_async --node-count 5 --time-limit 30 --rate 100 --nemesis partition
 
+broadcast-3d:
+    cargo build --bin broadcast --release
+    ./maelstrom test -w broadcast --bin ./target/release/broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100
+
+broadcast-3e:
+    cargo build --bin broadcast_async --release
+    ./maelstrom test -w broadcast --bin ./target/release/broadcast_async --node-count 25 --time-limit 20 --rate 100 --latency 100
+
 counter-4o:
     cargo build --bin counter
     ./maelstrom test -w g-counter --bin ./target/debug/counter --node-count 1 --time-limit 5 --rate 10
