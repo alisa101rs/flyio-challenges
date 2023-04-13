@@ -8,7 +8,8 @@ use std::{
 
 use eyre::eyre;
 use flyio_rs::{
-    azync::{event_loop, Event, Node, Rpc}, Message, Request,
+    azync::{event_loop, Event, Node, Rpc},
+    setup_with_telemetry, Message, Request,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -146,9 +147,9 @@ impl Node for BroadcastNode {
         node_ids: Vec<SmolStr>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
     ) -> eyre::Result<Self> {
-        //setup_with_telemetry(format!("broadcast-{node_id}"))?;
+        setup_with_telemetry(format!("broadcast-{node_id}"))?;
         tokio::task::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut interval = tokio::time::interval(Duration::from_millis(150));
             loop {
                 interval.tick().await;
                 if let Err(_) = tx.send(Event::Injected(Injected::Gossip)).await {
