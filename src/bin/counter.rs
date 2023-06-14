@@ -15,6 +15,7 @@ use std::{
 
 use flyio_rs::{
     azync::{event_loop, periodic_injection, Event, Node, Rpc},
+    network::Network,
     setup_with_telemetry, Message, Request, Response,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -117,9 +118,9 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct GrowCounter {
-    node_id: SmolStr,
+    network: Arc<Network>,
     myself: u64,
     ids: Arc<AtomicU64>,
     deltas: Arc<Mutex<HashSet<Delta>>>,
@@ -165,7 +166,7 @@ impl GrowCounter {
 
             let message = Message {
                 id: 0,
-                src: self.node_id.clone(),
+                src: self.network.id.clone(),
                 dst: node.clone(),
                 body: Request {
                     message_id: random(),
@@ -238,32 +239,36 @@ impl Node for GrowCounter {
     type Response = ResponsePayload;
 
     fn from_init(
-        node_id: SmolStr,
-        node_ids: Vec<SmolStr>,
+        network: Arc<Network>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
     ) -> eyre::Result<Self> {
-        setup_with_telemetry(format!("counter-{node_id}"))?;
+        setup_with_telemetry(format!("counter-{}", network.id))?;
 
         periodic_injection(tx.clone(), Duration::from_millis(300), Injected::Replicate);
         periodic_injection(tx, Duration::from_millis(1500), Injected::Compress);
 
-        let commits = node_ids
-            .clone()
+        let commits = network
+            .other_nodes()
             .into_iter()
-            .filter(|it| it != &node_id)
             .map(|it| (it, AtomicU64::new(0)))
             .collect();
 
-        let replications = node_ids
+        let replications = network
+            .other_nodes()
             .into_iter()
-            .filter(|it| it != &node_id)
             .map(|it| (it, AtomicU64::new(0)))
             .collect();
 
-        let myself = node_id.strip_prefix('n').unwrap().parse::<u64>().unwrap() + 1;
+        let myself = network
+            .id
+            .strip_prefix('n')
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            + 1;
 
         Ok(Self {
-            node_id,
+            network,
             myself,
             ids: Arc::new(AtomicU64::new(1)),
             deltas: Arc::new(Mutex::new(Default::default())),

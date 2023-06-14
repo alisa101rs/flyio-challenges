@@ -1,11 +1,15 @@
 use std::{collections::HashMap, sync::Arc};
 
-use flyio_rs::{azync::Rpc, Message, Request};
+use flyio_rs::{
+    azync::Rpc,
+    network::{Network, NodeId},
+    Message, Request,
+};
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use tracing::{info_span, instrument, Instrument};
 
-use crate::{network::Network, Key, NodeId, Offset, RequestPayload, ResponsePayload};
+use crate::{Key, Offset, RequestPayload, ResponsePayload};
 
 #[derive(Debug)]
 pub struct CommitTable {

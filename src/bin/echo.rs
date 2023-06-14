@@ -1,11 +1,13 @@
 #![feature(async_fn_in_trait)]
 
+use std::sync::Arc;
+
 use flyio_rs::{
     azync::{event_loop, Event, Node, Rpc},
+    network::Network,
     setup_tracing,
 };
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
 use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,8 +40,7 @@ impl Node for EchoNode {
     type Response = ResponsePayload;
 
     fn from_init(
-        _node_id: SmolStr,
-        _node_ids: Vec<SmolStr>,
+        _network: Arc<Network>,
         _tx: Sender<Event<Self::Request, Self::Injected>>,
     ) -> eyre::Result<Self> {
         Ok(Self)

@@ -4,12 +4,12 @@ use std::{
     sync::Arc,
 };
 
-use flyio_rs::{azync::Rpc, Message, Request};
+use flyio_rs::{azync::Rpc, network::Network, Message, Request};
 use parking_lot::Mutex;
 use rand::random;
 use tracing::instrument;
 
-use crate::{network::Network, Key, Offset, RequestPayload, ResponsePayload};
+use crate::{Key, Offset, RequestPayload, ResponsePayload};
 
 #[derive(Debug)]
 pub struct WriteLog {

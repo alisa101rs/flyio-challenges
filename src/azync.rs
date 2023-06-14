@@ -1,16 +1,15 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use derivative::Derivative;
 use eyre::{eyre, Result};
 use opentelemetry::propagation::Injector;
 use serde::{de::DeserializeOwned, Serialize};
-use smol_str::SmolStr;
 use tokio::{select, sync::mpsc, task::JoinHandle};
 use tracing::{info_span, instrument, Instrument, Span};
 
 mod mailbox;
 pub use self::mailbox::Mailbox;
-use crate::{initialize, Message, Request, Response};
+use crate::{initialize, network::Network, Message, Request, Response};
 
 #[derive(Debug, Clone)]
 pub enum Event<Req, Inj> {
@@ -62,8 +61,7 @@ pub trait Node: Sized + Clone {
     type Response;
 
     fn from_init(
-        node_id: SmolStr,
-        node_ids: Vec<SmolStr>,
+        network: Arc<Network>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
     ) -> eyre::Result<Self>;
 
@@ -85,7 +83,8 @@ where
     let (node_id, node_ids) = initialize()?;
     let (mailbox, mut messages) = mailbox::launch_mailbox_loop::<Req, Res>();
     let (tx, mut rv) = mpsc::channel(128);
-    let mut node = N::from_init(node_id, node_ids, tx)?;
+    let network = Network::create(node_id, node_ids);
+    let mut node = N::from_init(network, tx)?;
     let rpc = Rpc { mailbox };
 
     tokio::task::LocalSet::new()

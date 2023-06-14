@@ -9,6 +9,7 @@ use std::{
 use eyre::eyre;
 use flyio_rs::{
     azync::{event_loop, periodic_injection, Event, Node, Rpc},
+    network::Network,
     setup_with_telemetry, Message, Request,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -55,9 +56,9 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct BroadcastNode {
-    node_id: SmolStr,
+    network: Arc<Network>,
     seen: Arc<Mutex<HashSet<u64>>>,
     known: Arc<HashMap<SmolStr, Arc<Mutex<Option<HashSet<u64>>>>>>,
 }
@@ -105,7 +106,7 @@ impl BroadcastNode {
                 let message_id = rand::random();
                 Message {
                     id: message_id,
-                    src: self.node_id.clone(),
+                    src: self.network.id.clone(),
                     dst: dst.clone(),
                     body: Request {
                         message_id,
@@ -143,20 +144,20 @@ impl Node for BroadcastNode {
     type Response = ResponsePayload;
 
     fn from_init(
-        node_id: SmolStr,
-        node_ids: Vec<SmolStr>,
+        network: Arc<Network>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
     ) -> eyre::Result<Self> {
-        setup_with_telemetry(format!("broadcast-{node_id}"))?;
+        setup_with_telemetry(format!("broadcast-{}", network.id))?;
         periodic_injection(tx, Duration::from_millis(150), Injected::Gossip);
 
-        let known = node_ids
+        let known = network
+            .all_nodes()
             .into_iter()
             .map(|node| (node, Arc::new(Mutex::new(None))))
             .collect();
 
         Ok(Self {
-            node_id,
+            network,
             seen: Arc::new(Mutex::new(Default::default())),
             known: Arc::new(known),
         })
@@ -178,7 +179,7 @@ impl Node for BroadcastNode {
                     RequestPayload::Topology { mut topology } => {
                         self.topology(
                             topology
-                                .remove(&self.node_id)
+                                .remove(&self.network.id)
                                 .ok_or(eyre!("topology missing self"))
                                 .unwrap(),
                         );

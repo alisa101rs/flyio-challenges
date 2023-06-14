@@ -10,6 +10,7 @@ use std::{
 
 use flyio_rs::{
     azync::{event_loop, periodic_injection, Event, Node, Rpc},
+    network::Network,
     setup_with_telemetry, Message, Request, Response,
 };
 use parking_lot::Mutex;
@@ -20,19 +21,16 @@ use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crate::{
-    bucket::LogBucket, commit_table::CommitTable, leaders::TopicLeaders, network::Network,
-    write_log::WriteLog,
+    bucket::LogBucket, commit_table::CommitTable, leaders::TopicLeaders, write_log::WriteLog,
 };
 
 pub type Key = SmolStr;
-pub type NodeId = SmolStr;
 pub type Offset = u64;
 pub type Log = (Offset, u64);
 
 mod bucket;
 mod commit_table;
 mod leaders;
-mod network;
 mod partitions;
 mod write_log;
 
@@ -222,12 +220,10 @@ impl Node for KafkaLogNode {
     type Response = ResponsePayload;
 
     fn from_init(
-        node_id: NodeId,
-        node_ids: Vec<NodeId>,
+        network: Arc<Network>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
     ) -> eyre::Result<Self> {
-        setup_with_telemetry(format!("kafka-{node_id}"))?;
-        let network = Arc::new(Network::create(node_id, node_ids));
+        setup_with_telemetry(format!("kafka-{}", network.id))?;
 
         periodic_injection(
             tx.clone(),

@@ -1,6 +1,7 @@
 #![feature(async_fn_in_trait)]
 
 pub mod azync;
+pub mod network;
 pub mod sync;
 
 use std::{

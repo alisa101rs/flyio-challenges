@@ -5,10 +5,11 @@ use std::{
 };
 
 use derivative::Derivative;
+use flyio_rs::network::{Network, NodeId};
 use fnv::FnvHasher;
 use parking_lot::Mutex;
 
-use crate::{network::Network, Key, NodeId};
+use crate::Key;
 
 #[derive(Debug)]
 pub struct TopicLeaders {

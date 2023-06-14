@@ -34,3 +34,7 @@ opentelemetry-otlp = { version = "0.11.0" }
 [[bin]]
 name = "kafka"
 path = "src/bin/kafka/mod.rs"
+
+[[bin]]
+name = "txn-rw"
+path = "src/bin/txn-rw/mod.rs"
