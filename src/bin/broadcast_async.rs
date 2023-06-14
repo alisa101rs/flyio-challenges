@@ -17,7 +17,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
-use tracing::{info_span, instrument, Instrument, Span};
+use tracing::{info_span, instrument, Instrument};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -164,63 +164,54 @@ impl Node for BroadcastNode {
 
     #[instrument(skip(self, rpc), err)]
     async fn process_event(
-        &self,
+        &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: &Rpc<Self::Response>,
+        rpc: Rpc<Self::Response>,
     ) -> eyre::Result<()> {
-        let node = self.clone();
-        let rpc = rpc.clone();
-        let span = Span::current();
-
-        tokio::task::spawn(
-            async move {
-                match event {
-                    Event::Injected(Injected::Gossip) => {
-                        node.gossip(&rpc);
-                    }
-                    Event::Request(message) => {
-                        let from = message.src.clone();
-                        let response = message.into_reply(|payload| match payload {
-                            RequestPayload::Topology { mut topology } => {
-                                node.topology(
-                                    topology
-                                        .remove(&node.node_id)
-                                        .ok_or(eyre!("topology missing self"))
-                                        .unwrap(),
-                                );
-                                ResponsePayload::TopologyOk
-                            }
-                            RequestPayload::Broadcast { message } => {
-                                node.seen.lock().insert(message);
-                                ResponsePayload::BroadcastOk
-                            }
-                            RequestPayload::Read => ResponsePayload::ReadOk {
-                                messages: node.seen.lock().clone(),
-                            },
-                            RequestPayload::Gossip { notify } => {
-                                node.seen.lock().extend(notify.iter());
-                                if let Some(known) = node.known.get(&from) {
-                                    if let Some(known) = &mut *known.lock() {
-                                        known.extend(notify.iter());
-                                        ResponsePayload::GossipOk {
-                                            acknowledged: notify,
-                                        }
-                                    } else {
-                                        panic!("gossip_ok from non-neighbor")
-                                    }
-                                } else {
-                                    panic!("gossip_ok from non-neighbor")
-                                }
-                            }
-                        });
-
-                        rpc.respond(response);
-                    }
-                    Event::EOF => {}
-                }
+        match event {
+            Event::Injected(Injected::Gossip) => {
+                self.gossip(&rpc);
             }
-            .instrument(span),
-        );
+            Event::Request(message) => {
+                let from = message.src.clone();
+                let response = message.into_reply(|payload| match payload {
+                    RequestPayload::Topology { mut topology } => {
+                        self.topology(
+                            topology
+                                .remove(&self.node_id)
+                                .ok_or(eyre!("topology missing self"))
+                                .unwrap(),
+                        );
+                        ResponsePayload::TopologyOk
+                    }
+                    RequestPayload::Broadcast { message } => {
+                        self.seen.lock().insert(message);
+                        ResponsePayload::BroadcastOk
+                    }
+                    RequestPayload::Read => ResponsePayload::ReadOk {
+                        messages: self.seen.lock().clone(),
+                    },
+                    RequestPayload::Gossip { notify } => {
+                        self.seen.lock().extend(notify.iter());
+                        if let Some(known) = self.known.get(&from) {
+                            if let Some(known) = &mut *known.lock() {
+                                known.extend(notify.iter());
+                                ResponsePayload::GossipOk {
+                                    acknowledged: notify,
+                                }
+                            } else {
+                                panic!("gossip_ok from non-neighbor")
+                            }
+                        } else {
+                            panic!("gossip_ok from non-neighbor")
+                        }
+                    }
+                });
+
+                rpc.respond(response);
+            }
+            Event::EOF => {}
+        }
 
         Ok(())
     }

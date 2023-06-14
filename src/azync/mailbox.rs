@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use derivative::Derivative;
 use eyre::{Context, Report};
 use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Serialize};
@@ -7,7 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{Message, Output, Request, RequestOrResponse, Response};
 
-#[derive(Clone)]
+#[derive(Derivative)]
+#[derivative(Clone(bound = ""))]
 pub struct Mailbox<Res> {
     letters: Arc<Mutex<HashMap<u64, oneshot::Sender<Message<Response<Res>>>>>>,
     pub(crate) output: Output,

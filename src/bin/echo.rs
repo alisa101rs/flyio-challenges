@@ -29,6 +29,7 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
+#[derive(Copy, Clone, Debug)]
 struct EchoNode;
 
 impl Node for EchoNode {
@@ -45,9 +46,9 @@ impl Node for EchoNode {
     }
 
     async fn process_event(
-        &self,
+        &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: &Rpc<Self::Response>,
+        rpc: Rpc<Self::Response>,
     ) -> eyre::Result<()> {
         match event {
             Event::Request(message) => {

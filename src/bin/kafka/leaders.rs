@@ -5,7 +5,6 @@ use std::{
 };
 
 use derivative::Derivative;
-
 use fnv::FnvHasher;
 use parking_lot::Mutex;
 
@@ -76,7 +75,7 @@ pub struct HasherElections<H> {
 
 impl<H: Hasher + Default> HasherElections<H> {
     pub fn choose_leader(&self, key: &Key, nodes: &[NodeId]) -> NodeId {
-        use std::hash::{BuildHasher, Hash, Hasher};
+        use std::hash::{BuildHasher, Hash};
 
         let mut hasher = self.hasher.build_hasher();
         key.hash(&mut hasher);

@@ -117,12 +117,12 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct GrowCounter {
     node_id: SmolStr,
     myself: u64,
-    ids: AtomicU64,
-    deltas: Mutex<HashSet<Delta>>,
+    ids: Arc<AtomicU64>,
+    deltas: Arc<Mutex<HashSet<Delta>>>,
     commits: Arc<HashMap<SmolStr, AtomicU64>>,
     replications: Arc<HashMap<SmolStr, AtomicU64>>,
 }
@@ -136,7 +136,7 @@ impl GrowCounter {
     }
 
     #[instrument(skip(self, rpc), err)]
-    fn replicate(&self, rpc: &Rpc<ResponsePayload>) -> eyre::Result<()> {
+    async fn replicate(&self, rpc: &Rpc<ResponsePayload>) -> eyre::Result<()> {
         let mut futures = FuturesUnordered::new();
         for (node, last_commit) in &*self.commits {
             let last_commit_from_n = last_commit.load(Ordering::Relaxed);
@@ -195,16 +195,14 @@ impl GrowCounter {
         }
 
         let commits = self.commits.clone();
-        tokio::task::spawn(async move {
-            while let Some(response) = futures.next().await {
-                if let Some((src, last_commit)) = response {
-                    commits
-                        .get(&src)
-                        .unwrap()
-                        .fetch_max(last_commit, Ordering::Relaxed);
-                }
+        while let Some(response) = futures.next().await {
+            if let Some((src, last_commit)) = response {
+                commits
+                    .get(&src)
+                    .unwrap()
+                    .fetch_max(last_commit, Ordering::Relaxed);
             }
-        });
+        }
 
         Ok(())
     }
@@ -267,8 +265,8 @@ impl Node for GrowCounter {
         Ok(Self {
             node_id,
             myself,
-            ids: AtomicU64::new(1),
-            deltas: Mutex::new(Default::default()),
+            ids: Arc::new(AtomicU64::new(1)),
+            deltas: Arc::new(Mutex::new(Default::default())),
             commits: Arc::new(commits),
             replications: Arc::new(replications),
         })
@@ -276,13 +274,13 @@ impl Node for GrowCounter {
 
     #[instrument(skip(self, rpc), err)]
     async fn process_event(
-        &self,
+        &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: &Rpc<Self::Response>,
+        rpc: Rpc<Self::Response>,
     ) -> eyre::Result<()> {
         match event {
             Event::Injected(Injected::Replicate) => {
-                self.replicate(rpc)?;
+                self.replicate(&rpc).await?;
                 Ok(())
             }
             Event::Injected(Injected::Compress) => {

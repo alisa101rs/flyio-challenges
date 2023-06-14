@@ -33,6 +33,9 @@ impl Network {
 #[derive(Debug, Clone)]
 pub struct Node {
     id: NodeId,
+
+    // TODO: implement later
+    #[allow(dead_code)]
     health: HealthStatus,
 }
 

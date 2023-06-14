@@ -1,11 +1,12 @@
 use std::time::Duration;
 
+use derivative::Derivative;
 use eyre::{eyre, Result};
 use opentelemetry::propagation::Injector;
 use serde::{de::DeserializeOwned, Serialize};
 use smol_str::SmolStr;
 use tokio::{select, sync::mpsc, task::JoinHandle};
-use tracing::{info_span, instrument, Span};
+use tracing::{info_span, instrument, Instrument, Span};
 
 mod mailbox;
 pub use self::mailbox::Mailbox;
@@ -18,7 +19,8 @@ pub enum Event<Req, Inj> {
     EOF,
 }
 
-#[derive(Clone)]
+#[derive(Derivative)]
+#[derivative(Clone(bound = ""))]
 pub struct Rpc<Res> {
     mailbox: Mailbox<Res>,
 }
@@ -54,7 +56,7 @@ where
     }
 }
 
-pub trait Node: Sized {
+pub trait Node: Sized + Clone {
     type Injected;
     type Request;
     type Response;
@@ -66,16 +68,16 @@ pub trait Node: Sized {
     ) -> eyre::Result<Self>;
 
     async fn process_event(
-        &self,
+        &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: &Rpc<Self::Response>,
+        rpc: Rpc<Self::Response>,
     ) -> eyre::Result<()>;
 }
 
 #[instrument(err)]
 pub async fn event_loop<N, Req, Res>() -> eyre::Result<()>
 where
-    N: Node<Request = Req, Response = Res>,
+    N: Node<Request = Req, Response = Res> + 'static,
     Req: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug,
     Res: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug,
     N::Injected: Send + 'static,
@@ -83,30 +85,41 @@ where
     let (node_id, node_ids) = initialize()?;
     let (mailbox, mut messages) = mailbox::launch_mailbox_loop::<Req, Res>();
     let (tx, mut rv) = mpsc::channel(128);
-    let node = N::from_init(node_id, node_ids, tx)?;
+    let mut node = N::from_init(node_id, node_ids, tx)?;
     let rpc = Rpc { mailbox };
 
-    loop {
-        let event = select!(
-            maybe_message = messages.recv() => {
-                if let Some(message) = maybe_message {
-                     Event::Request(message)
-                } else {
-                    node.process_event(Event::EOF, &rpc).await?;
-                    break
-                }
-            },
-            Some(event) = rv.recv() => {
-                event
-            }
-        );
-        let span = get_span(&event);
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            loop {
+                let event = select!(
+                    maybe_message = messages.recv() => {
+                        if let Some(message) = maybe_message {
+                            Event::Request(message)
+                        } else {
+                            node.process_event(Event::EOF, rpc).await.unwrap();
+                            break;
+                        }
+                    },
+                    Some(event) = rv.recv() => {
+                        event
+                    }
+                );
 
-        {
-            let _guard = span.enter();
-            node.process_event(event, &rpc).await?;
-        }
-    }
+                let rpc = rpc.clone();
+                let mut node = node.clone();
+                let span = get_span(&event);
+                tokio::task::spawn_local(
+                    async move {
+                        tracing::debug!("Started processing");
+                        if let Err(_er) = node.process_event(event, rpc).await {
+                            todo!()
+                        }
+                    }
+                    .instrument(span),
+                );
+            }
+        })
+        .await;
 
     Ok(())
 }

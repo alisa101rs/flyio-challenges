@@ -4,27 +4,20 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    hash::{Hasher},
-    sync::{
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
-
-
 
 use flyio_rs::{
     azync::{event_loop, periodic_injection, Event, Node, Rpc},
     setup_with_telemetry, Message, Request, Response,
 };
-
-use futures::{StreamExt};
 use parking_lot::Mutex;
 use rand::random;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
-use tracing::{instrument, Instrument, Span};
+use tracing::instrument;
 
 use crate::{
     bucket::LogBucket, commit_table::CommitTable, leaders::TopicLeaders, network::Network,
@@ -258,67 +251,49 @@ impl Node for KafkaLogNode {
 
     #[instrument(skip(self, rpc), err)]
     async fn process_event(
-        &self,
+        &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: &Rpc<Self::Response>,
+        rpc: Rpc<Self::Response>,
     ) -> eyre::Result<()> {
         match event {
             Event::Injected(Injected::GossipCommits) => {
-                self.commits.clone().gossip_commits(rpc);
+                self.commits.clone().gossip_commits(&rpc);
             }
             Event::Injected(Injected::PropagateWrites) => {
-                let this = self.clone();
-                let rpc = rpc.clone();
-                let span = Span::current();
-                tokio::task::spawn(
-                    async move { this.init_propagate_writes(rpc).await }.instrument(span),
-                );
+                self.init_propagate_writes(rpc).await;
             }
             Event::EOF => {}
             Event::Request(message) => {
-                let span = Span::current();
-                let node = self.clone();
-                let rpc = rpc.clone();
-
-                tokio::task::spawn(
-                    async move {
-                        let payload = match message.body.payload {
-                            RequestPayload::Send { ref key, message } => {
-                                node.send(key.clone(), message, &rpc).await
-                            }
-                            RequestPayload::Poll { ref offsets } => node.poll(offsets),
-                            RequestPayload::CommitOffsets { offsets } => {
-                                node.commit_offsets(offsets)
-                            }
-                            RequestPayload::ListCommittedOffsets { ref keys } => {
-                                node.list_committed_offsets(keys)
-                            }
-                            RequestPayload::GossipCommits { commits } => {
-                                node.commits.accept_gossip_commits(&message.src, commits);
-                                ResponsePayload::GossipCommitsOk
-                            }
-                            RequestPayload::PropagateWrites { messages } => {
-                                node.propagate_writes(messages)
-                            }
-                            RequestPayload::AcknowledgeWrites { offsets, .. } => {
-                                node.acknowledge_writes(offsets);
-                                ResponsePayload::AcknowledgeWritesOk
-                            }
-                        };
-
-                        let response = Message {
-                            id: message.id,
-                            src: message.dst,
-                            dst: message.src,
-                            body: Response {
-                                in_reply_to: message.body.message_id,
-                                payload,
-                            },
-                        };
-                        rpc.respond(response);
+                let payload = match message.body.payload {
+                    RequestPayload::Send { ref key, message } => {
+                        self.send(key.clone(), message, &rpc).await
                     }
-                    .instrument(span),
-                );
+                    RequestPayload::Poll { ref offsets } => self.poll(offsets),
+                    RequestPayload::CommitOffsets { offsets } => self.commit_offsets(offsets),
+                    RequestPayload::ListCommittedOffsets { ref keys } => {
+                        self.list_committed_offsets(keys)
+                    }
+                    RequestPayload::GossipCommits { commits } => {
+                        self.commits.accept_gossip_commits(&message.src, commits);
+                        ResponsePayload::GossipCommitsOk
+                    }
+                    RequestPayload::PropagateWrites { messages } => self.propagate_writes(messages),
+                    RequestPayload::AcknowledgeWrites { offsets, .. } => {
+                        self.acknowledge_writes(offsets);
+                        ResponsePayload::AcknowledgeWritesOk
+                    }
+                };
+
+                let response = Message {
+                    id: message.id,
+                    src: message.dst,
+                    dst: message.src,
+                    body: Response {
+                        in_reply_to: message.body.message_id,
+                        payload,
+                    },
+                };
+                rpc.respond(response);
             }
         }
 
