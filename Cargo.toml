@@ -29,3 +29,8 @@ tracing-appender = "0.2"
 tracing-opentelemetry = "0.18.0"
 opentelemetry = { version = "0.18.0", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.11.0" }
+
+
+[[bin]]
+name = "kafka"
+path = "src/bin/kafka/mod.rs"

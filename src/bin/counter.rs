@@ -14,7 +14,7 @@ use std::{
 };
 
 use flyio_rs::{
-    azync::{event_loop, Event, Node, Rpc},
+    azync::{event_loop, periodic_injection, Event, Node, Rpc},
     setup_with_telemetry, Message, Request, Response,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -246,28 +246,8 @@ impl Node for GrowCounter {
     ) -> eyre::Result<Self> {
         setup_with_telemetry(format!("counter-{node_id}"))?;
 
-        {
-            let tx = tx.clone();
-            tokio::task::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(300));
-                loop {
-                    interval.tick().await;
-                    if let Err(_) = tx.send(Event::Injected(Injected::Replicate)).await {
-                        return;
-                    }
-                }
-            });
-        }
-
-        tokio::task::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(1500));
-            loop {
-                interval.tick().await;
-                if let Err(_) = tx.send(Event::Injected(Injected::Compress)).await {
-                    return;
-                }
-            }
-        });
+        periodic_injection(tx.clone(), Duration::from_millis(300), Injected::Replicate);
+        periodic_injection(tx, Duration::from_millis(1500), Injected::Compress);
 
         let commits = node_ids
             .clone()

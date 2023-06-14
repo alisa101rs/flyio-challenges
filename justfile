@@ -3,7 +3,7 @@
 
 cargo-fix-all:
     cargo fix --allow-dirty --allow-staged --all
-    cargo clippy --fix --allow-dirty --allow-staged --all
+    cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features
 
 cargo-build-all:
     cargo b --all-targets
@@ -71,6 +71,14 @@ kafka-5o:
 kafka-5a:
      cargo build --bin kafka
      ./maelstrom test -w kafka --bin ./target/debug/kafka --node-count 1  --concurrency 2n --rate 1000 --time-limit 20
+
+kafka-5b:
+     cargo build --bin kafka
+     ./maelstrom test -w kafka --bin ./target/debug/kafka --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
+
+kafka-5c:
+     cargo build --bin kafka  --release
+     ./maelstrom test -w kafka --bin ./target/release/kafka --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
 
 
 
