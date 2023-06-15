@@ -138,7 +138,7 @@ impl KafkaLogNode {
     }
 
     #[instrument(skip(self, rpc), ret)]
-    async fn send(&self, key: Key, message: u64, rpc: &Rpc<ResponsePayload>) -> ResponsePayload {
+    async fn send(&self, key: Key, message: u64, rpc: &Rpc) -> ResponsePayload {
         let node = self.topic_leaders.get_or_insert(&key).await;
         if node == self.network.id {
             let offset = self.create_write(key, message).await;
@@ -197,7 +197,7 @@ impl KafkaLogNode {
     }
 
     #[instrument(skip(self, rpc))]
-    async fn init_propagate_writes(&self, rpc: Rpc<ResponsePayload>) {
+    async fn init_propagate_writes(&self, rpc: Rpc) {
         let messages = self.write_log.propagate_writes(rpc.clone()).await;
         let mut buckets = self.buckets.lock();
         for (key, logs) in messages {
@@ -249,7 +249,7 @@ impl Node for KafkaLogNode {
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc<Self::Response>,
+        rpc: Rpc,
     ) -> eyre::Result<()> {
         match event {
             Event::Injected(Injected::GossipCommits) => {

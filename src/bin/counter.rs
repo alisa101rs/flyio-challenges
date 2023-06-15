@@ -137,7 +137,7 @@ impl GrowCounter {
     }
 
     #[instrument(skip(self, rpc), err)]
-    async fn replicate(&self, rpc: &Rpc<ResponsePayload>) -> eyre::Result<()> {
+    async fn replicate(&self, rpc: &Rpc) -> eyre::Result<()> {
         let mut futures = FuturesUnordered::new();
         for (node, last_commit) in &*self.commits {
             let last_commit_from_n = last_commit.load(Ordering::Relaxed);
@@ -281,7 +281,7 @@ impl Node for GrowCounter {
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc<Self::Response>,
+        rpc: Rpc,
     ) -> eyre::Result<()> {
         match event {
             Event::Injected(Injected::Replicate) => {

@@ -71,9 +71,9 @@ impl From<RawOp> for Operation {
     }
 }
 
-impl Into<RawOp> for OperationResult {
-    fn into(self) -> RawOp {
-        match self {
+impl From<OperationResult> for RawOp {
+    fn from(val: OperationResult) -> Self {
+        match val {
             OperationResult::Read { key, value } => RawOp(OpType::Read, key, value),
             OperationResult::Write { key, value } => RawOp(OpType::Write, key, Some(value)),
         }
@@ -111,12 +111,12 @@ impl Node for TxnNode {
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc<Self::Response>,
+        rpc: Rpc,
     ) -> eyre::Result<()> {
         match event {
             Event::Request(message) => {
                 let payload = match message.body.payload {
-                    RequestPayload::Txn { txn } => ResponsePayload::TxnOk { txn: vec![] },
+                    RequestPayload::Txn { txn: _ } => ResponsePayload::TxnOk { txn: vec![] },
                 };
 
                 let response = Message {

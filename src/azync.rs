@@ -1,9 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
-use derivative::Derivative;
-use eyre::{eyre, Result};
+use eyre::{eyre, Context, Result};
 use opentelemetry::propagation::Injector;
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::value::from_value;
 use tokio::{select, sync::mpsc, task::JoinHandle};
 use tracing::{info_span, instrument, Instrument, Span};
 
@@ -18,31 +18,36 @@ pub enum Event<Req, Inj> {
     EOF,
 }
 
-#[derive(Derivative)]
-#[derivative(Clone(bound = ""))]
-pub struct Rpc<Res> {
-    mailbox: Mailbox<Res>,
+#[derive(Clone)]
+pub struct Rpc {
+    mailbox: Mailbox,
 }
 
-impl<Res> Rpc<Res>
-where
-    Res: Serialize + std::fmt::Debug,
-{
-    pub fn respond(&self, response: Message<Response<Res>>) {
+impl Rpc {
+    pub fn respond<Res>(&self, response: Message<Response<Res>>)
+    where
+        Res: Serialize + std::fmt::Debug,
+    {
         self.mailbox.output.write(Some(response));
     }
 
     #[instrument(skip(self, req))]
-    pub async fn send<Req>(&self, mut req: Message<Request<Req>>) -> Result<Message<Response<Res>>>
+    pub async fn send<Req, Res>(
+        &self,
+        mut req: Message<Request<Req>>,
+    ) -> Result<Message<Response<Res>>>
     where
         Req: Serialize + std::fmt::Debug,
+        Res: DeserializeOwned + std::fmt::Debug,
     {
         inject_trace(&mut req);
         tracing::debug!(request = ?req, "Sending request");
         let rv = self.mailbox.send(req);
 
         match tokio::time::timeout(Duration::from_millis(250), rv).await {
-            Ok(Ok(res)) => Ok(res),
+            Ok(Ok(res)) => res
+                .try_map_payload(|value| from_value(value))
+                .wrap_err(eyre!("could not deserialize response")),
             Ok(Err(er)) => {
                 tracing::error!(?er, "Could not receive response");
                 Err(eyre!("Error: {er:?}"))
@@ -68,7 +73,7 @@ pub trait Node: Sized + Clone {
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc<Self::Response>,
+        rpc: Rpc,
     ) -> eyre::Result<()>;
 }
 
@@ -81,7 +86,7 @@ where
     N::Injected: Send + 'static,
 {
     let (node_id, node_ids) = initialize()?;
-    let (mailbox, mut messages) = mailbox::launch_mailbox_loop::<Req, Res>();
+    let (mailbox, mut messages) = mailbox::launch_mailbox_loop::<Req>();
     let (tx, mut rv) = mpsc::channel(128);
     let network = Network::create(node_id, node_ids);
     let mut node = N::from_init(network, tx)?;

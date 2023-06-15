@@ -1,25 +1,24 @@
 use std::{collections::HashMap, sync::Arc};
 
-use derivative::Derivative;
 use eyre::{Context, Report};
 use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{Message, Output, Request, RequestOrResponse, Response};
 
-#[derive(Derivative)]
-#[derivative(Clone(bound = ""))]
-pub struct Mailbox<Res> {
-    letters: Arc<Mutex<HashMap<u64, oneshot::Sender<Message<Response<Res>>>>>>,
+#[derive(Clone)]
+pub struct Mailbox {
+    letters: Arc<Mutex<HashMap<u64, oneshot::Sender<Message<Response<Value>>>>>>,
     pub(crate) output: Output,
 }
 
-impl<Res> Mailbox<Res> {
+impl Mailbox {
     pub fn send<Req>(
         &self,
         message: Message<Request<Req>>,
-    ) -> oneshot::Receiver<Message<Response<Res>>>
+    ) -> oneshot::Receiver<Message<Response<Value>>>
     where
         Req: Serialize + std::fmt::Debug,
     {
@@ -31,10 +30,9 @@ impl<Res> Mailbox<Res> {
     }
 }
 
-pub fn launch_mailbox_loop<Req, Res>() -> (Mailbox<Res>, mpsc::Receiver<Message<Request<Req>>>)
+pub fn launch_mailbox_loop<Req>() -> (Mailbox, mpsc::Receiver<Message<Request<Req>>>)
 where
     Req: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug,
-    Res: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug,
 {
     let (tx, rv) = mpsc::channel(128);
     let letters = Arc::new(Mutex::new(Default::default()));
@@ -50,9 +48,10 @@ where
             for line in stdin.lines() {
                 let line = line.wrap_err("got invalid stdin")?;
                 tracing::debug!(%line, "Received line");
-                let message: Message<RequestOrResponse<Req, Res>> = serde_json::de::from_str(&line)
-                    .wrap_err("failed to deserialize message")
-                    .unwrap();
+                let message: Message<RequestOrResponse<Req, Value>> =
+                    serde_json::de::from_str(&line)
+                        .wrap_err("failed to deserialize message")
+                        .unwrap();
                 let Message { id, src, dst, body } = message;
                 match body {
                     RequestOrResponse::Response(res) => {
@@ -66,7 +65,7 @@ where
                         tracing::info!(?message, "Received response");
                         let mut letters = letters.lock();
                         if let Some(tx) = letters.remove(&in_reply_to) {
-                            if let Err(_) = tx.send(message) {
+                            if tx.send(message).is_err() {
                                 tracing::warn!(%in_reply_to, "Reply lost")
                             }
                         } else {

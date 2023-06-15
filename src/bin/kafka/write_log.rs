@@ -31,10 +31,7 @@ impl WriteLog {
     }
 
     #[instrument(skip(self, rpc))]
-    pub async fn propagate_writes(
-        &self,
-        rpc: Rpc<ResponsePayload>,
-    ) -> HashMap<Key, BTreeSet<(Offset, u64)>> {
+    pub async fn propagate_writes(&self, rpc: Rpc) -> HashMap<Key, BTreeSet<(Offset, u64)>> {
         let mut messages: HashMap<Key, BTreeSet<(Offset, u64)>> = HashMap::new();
         let mut offsets: HashMap<Key, Offset> = HashMap::new();
 
@@ -64,7 +61,7 @@ impl WriteLog {
                 },
             };
 
-            if let Ok(_response) = rpc.send(message).await {
+            if let Ok(_response) = rpc.send::<_, ResponsePayload>(message).await {
             } else {
                 unimplemented!("Unacknowledged write")
             }
@@ -84,7 +81,7 @@ impl WriteLog {
                 },
             };
 
-            if let Ok(_response) = rpc.send(message).await {
+            if let Ok(_response) = rpc.send::<_, ResponsePayload>(message).await {
             } else {
                 unimplemented!("Unacknowledged acknowledge")
             }

@@ -72,6 +72,31 @@ impl<Rq> Message<Request<Rq>> {
     }
 }
 
+impl<Res> Message<Response<Res>> {
+    pub fn try_map_payload<NewRes, F, E>(self, f: F) -> Result<Message<Response<NewRes>>, E>
+    where
+        F: FnOnce(Res) -> Result<NewRes, E>,
+    {
+        let Message {
+            id, src, dst, body, ..
+        } = self;
+        let Response {
+            in_reply_to,
+            payload,
+        } = body;
+
+        Ok(Message {
+            id,
+            src: dst,
+            dst: src,
+            body: Response {
+                in_reply_to,
+                payload: f(payload)?,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InitRequestPayload {

@@ -59,7 +59,7 @@ impl CommitTable {
     }
 
     #[instrument(skip(self, rpc))]
-    pub fn gossip_commits(self: Arc<Self>, rpc: &Rpc<ResponsePayload>) {
+    pub fn gossip_commits(self: Arc<Self>, rpc: &Rpc) {
         let mut futures = FuturesUnordered::new();
 
         for (dst, maybe_known_to) in self.known.iter() {

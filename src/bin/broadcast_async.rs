@@ -74,7 +74,7 @@ impl BroadcastNode {
     }
 
     #[instrument(skip(self, rpc))]
-    fn gossip(&self, rpc: &Rpc<ResponsePayload>) {
+    fn gossip(&self, rpc: &Rpc) {
         let mut futures = FuturesUnordered::new();
 
         for (dst, maybe_known_to) in self.known.iter() {
@@ -167,7 +167,7 @@ impl Node for BroadcastNode {
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc<Self::Response>,
+        rpc: Rpc,
     ) -> eyre::Result<()> {
         match event {
             Event::Injected(Injected::Gossip) => {

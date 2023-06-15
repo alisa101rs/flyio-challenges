@@ -49,7 +49,7 @@ impl Node for EchoNode {
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc<Self::Response>,
+        rpc: Rpc,
     ) -> eyre::Result<()> {
         match event {
             Event::Request(message) => {
