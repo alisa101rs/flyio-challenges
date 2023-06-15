@@ -2,7 +2,7 @@
 #![feature(hash_drain_filter)]
 #![feature(integer_atomics)]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use flyio_rs::{
     azync::{event_loop, Event, Node, Rpc},
@@ -16,7 +16,7 @@ use tracing::instrument;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<TxnNode, RequestPayload, ResponsePayload>().await?;
+    event_loop::<TxnNode, RequestPayload, ResponsePayload>(Some(Duration::from_millis(10))).await?;
 
     Ok(())
 }
@@ -30,6 +30,7 @@ pub struct TxnNode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestPayload {
     Txn { txn: Vec<Operation> },
+    Ping,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +38,7 @@ pub enum RequestPayload {
 pub enum ResponsePayload {
     TxnOk { txn: Vec<OperationResult> },
     Error { code: ErrorCode, text: String },
+    Pong,
 }
 
 #[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Copy, Clone)]
@@ -117,6 +119,7 @@ impl Node for TxnNode {
             Event::Request(message) => {
                 let payload = match message.body.payload {
                     RequestPayload::Txn { txn: _ } => ResponsePayload::TxnOk { txn: vec![] },
+                    RequestPayload::Ping => ResponsePayload::Pong,
                 };
 
                 let response = Message {

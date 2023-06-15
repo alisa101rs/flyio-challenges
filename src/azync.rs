@@ -9,7 +9,11 @@ use tracing::{info_span, instrument, Instrument, Span};
 
 mod mailbox;
 pub use self::mailbox::Mailbox;
-use crate::{initialize, network::Network, Message, Request, Response};
+use crate::{
+    initialize,
+    network::{heartbeat_loop, Network},
+    Message, Request, Response,
+};
 
 #[derive(Debug, Clone)]
 pub enum Event<Req, Inj> {
@@ -78,7 +82,7 @@ pub trait Node: Sized + Clone {
 }
 
 #[instrument(err)]
-pub async fn event_loop<N, Req, Res>() -> eyre::Result<()>
+pub async fn event_loop<N, Req, Res>(heartbeat_period: Option<Duration>) -> eyre::Result<()>
 where
     N: Node<Request = Req, Response = Res> + 'static,
     Req: Serialize + DeserializeOwned + Send + 'static + std::fmt::Debug,
@@ -89,8 +93,13 @@ where
     let (mailbox, mut messages) = mailbox::launch_mailbox_loop::<Req>();
     let (tx, mut rv) = mpsc::channel(128);
     let network = Network::create(node_id, node_ids);
-    let mut node = N::from_init(network, tx)?;
     let rpc = Rpc { mailbox };
+    let mut node = N::from_init(network.clone(), tx)?;
+    let guard = if let Some(heartbeat_period) = heartbeat_period {
+        tokio::task::spawn(heartbeat_loop(heartbeat_period, network, rpc.clone()))
+    } else {
+        tokio::task::spawn(async move { Ok(()) })
+    };
 
     tokio::task::LocalSet::new()
         .run_until(async move {
@@ -124,6 +133,7 @@ where
             }
         })
         .await;
+    guard.abort();
 
     Ok(())
 }

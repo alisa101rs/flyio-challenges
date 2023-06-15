@@ -51,7 +51,7 @@ pub enum Injected {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<BroadcastNode, _, _>().await?;
+    event_loop::<BroadcastNode, _, _>(None).await?;
 
     Ok(())
 }

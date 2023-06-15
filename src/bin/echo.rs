@@ -26,7 +26,7 @@ pub enum ResponsePayload {
 async fn main() -> eyre::Result<()> {
     setup_tracing()?;
 
-    event_loop::<EchoNode, RequestPayload, ResponsePayload>().await?;
+    event_loop::<EchoNode, RequestPayload, ResponsePayload>(None).await?;
 
     Ok(())
 }

@@ -36,7 +36,7 @@ mod write_log;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<KafkaLogNode, RequestPayload, ResponsePayload>().await?;
+    event_loop::<KafkaLogNode, RequestPayload, ResponsePayload>(None).await?;
 
     Ok(())
 }

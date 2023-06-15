@@ -113,7 +113,7 @@ impl Hash for Delta {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<GrowCounter, RequestPayload, ResponsePayload>().await?;
+    event_loop::<GrowCounter, RequestPayload, ResponsePayload>(None).await?;
 
     Ok(())
 }
