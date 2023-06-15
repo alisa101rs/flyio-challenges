@@ -10,7 +10,9 @@ use flyio_rs::{
     setup_with_telemetry, Message, Response,
 };
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use tokio::sync::mpsc::Sender;
+use tracing::instrument;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -33,11 +35,53 @@ pub enum RequestPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsePayload {
-    TxnOk { txn: Vec<Operation> },
+    TxnOk { txn: Vec<OperationResult> },
+    Error { code: ErrorCode, text: String },
+}
+
+#[derive(Serialize_repr, Deserialize_repr, PartialEq, Debug, Copy, Clone)]
+#[repr(u8)]
+pub enum ErrorCode {
+    TxnConflict = 30,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Operation(OpType, u64, Option<u64>);
+#[serde(from = "RawOp")]
+pub enum Operation {
+    Read { key: u64 },
+    Write { key: u64, value: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(into = "RawOp")]
+pub enum OperationResult {
+    Read { key: u64, value: Option<u64> },
+    Write { key: u64, value: u64 },
+}
+
+impl From<RawOp> for Operation {
+    fn from(RawOp(op, key, v): RawOp) -> Self {
+        match op {
+            OpType::Write => Self::Write {
+                key,
+                value: v.unwrap(),
+            },
+            OpType::Read => Self::Read { key },
+        }
+    }
+}
+
+impl Into<RawOp> for OperationResult {
+    fn into(self) -> RawOp {
+        match self {
+            OperationResult::Read { key, value } => RawOp(OpType::Read, key, value),
+            OperationResult::Write { key, value } => RawOp(OpType::Write, key, Some(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawOp(OpType, u64, Option<u64>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OpType {
@@ -63,6 +107,7 @@ impl Node for TxnNode {
         Ok(Self { network })
     }
 
+    #[instrument(skip(self, rpc), err)]
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
@@ -71,7 +116,7 @@ impl Node for TxnNode {
         match event {
             Event::Request(message) => {
                 let payload = match message.body.payload {
-                    RequestPayload::Txn { txn } => ResponsePayload::TxnOk { txn },
+                    RequestPayload::Txn { txn } => ResponsePayload::TxnOk { txn: vec![] },
                 };
 
                 let response = Message {
