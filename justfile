@@ -33,15 +33,15 @@ unique_id:
     ./maelstrom test -w unique-ids --bin ./target/debug/unique_id --time-limit 30 --rate 2000 --node-count 5 --availability total --nemesis partition
 
 broadcast-3a:
-    cargo build --bin broadcast_async
+    cargo build --bin broadcast
     ./maelstrom test -w broadcast --bin ./target/debug/broadcast_async --node-count 1 --time-limit 5 --rate 20
 
 broadcast-3b:
-    cargo build --bin broadcast_async
+    cargo build --bin broadcast
     ./maelstrom test -w broadcast --bin ./target/debug/broadcast_async --node-count 5 --time-limit 20 --rate 10
 
 broadcast-3c:
-    cargo build --bin broadcast_async --release
+    cargo build --bin broadcast --release
     ./maelstrom test -w broadcast --bin ./target/release/broadcast_async --node-count 5 --time-limit 30 --rate 100 --nemesis partition
 
 broadcast-3d:
@@ -49,7 +49,7 @@ broadcast-3d:
     ./maelstrom test -w broadcast --bin ./target/release/broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100
 
 broadcast-3e:
-    cargo build --bin broadcast_async --release
+    cargo build --bin broadcast --release
     ./maelstrom test -w broadcast --bin ./target/release/broadcast_async --node-count 25 --time-limit 20 --rate 100 --latency 100
 
 counter-4o:

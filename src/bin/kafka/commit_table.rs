@@ -1,9 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use flyio_rs::{
-    azync::Rpc,
-    network::{Network, NodeId},
-    Message, Request,
+    network::{Network, NodeId}, Rpc,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -90,30 +88,21 @@ impl CommitTable {
                 }
 
                 tracing::debug!(gossips = ?notify, "Sending gossip");
-                let message_id = rand::random();
-                let message = Message {
-                    id: message_id,
-                    src: self.network.id.clone(),
-                    dst: dst.clone(),
-                    body: Request {
-                        message_id,
-                        traceparent: None,
-                        payload: RequestPayload::GossipCommits {
-                            commits: notify.clone(),
-                        },
-                    },
+                let message = RequestPayload::GossipCommits {
+                    commits: notify.clone(),
                 };
 
                 (message, notify)
             };
 
+            let dst = dst.clone();
             let rpc = rpc.clone();
             let span = info_span!("Gossiping Commits");
             let known_to = maybe_known_to.clone();
             futures.push(
                 async move {
-                    if let Ok(response) = rpc.send(message).await {
-                        match response.body.payload {
+                    if let Ok(payload) = rpc.send(dst, message).await {
+                        match payload {
                             ResponsePayload::GossipCommitsOk => {
                                 let mut known_to = known_to.lock();
                                 known_to.extend(notify.into_iter());

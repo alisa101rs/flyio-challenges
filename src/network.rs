@@ -4,13 +4,12 @@ use std::{
 };
 
 use parking_lot::RwLock;
-use rand::random;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use tokio::sync::mpsc::{channel, Sender};
 use tracing::Instrument;
 
-use crate::{azync::Rpc, Message, Request};
+use crate::Rpc;
 
 pub type NodeId = SmolStr;
 
@@ -32,7 +31,7 @@ impl Network {
         self.nodes
             .read()
             .iter()
-            .filter(|&it| it.id != self.id)
+            .filter(|&it| it.id != self.id && it.is_alive())
             .map(|it| it.id.clone())
             .collect()
     }
@@ -61,6 +60,10 @@ impl Node {
         }
     }
 
+    fn is_alive(&self) -> bool {
+        matches!(self.health, HealthStatus::Alive)
+    }
+
     fn set_alive(&mut self, last_pong: Instant) {
         self.health = HealthStatus::Alive;
         match self.last_pong {
@@ -73,7 +76,7 @@ impl Node {
 
     fn no_pong_received(&mut self, timeout_received_at: Instant) {
         match (self.health, self.last_pong) {
-            (HealthStatus::Disconnected, _) => return,
+            (HealthStatus::Disconnected, _) => (),
             (_, Some(last_pong)) if timeout_received_at - last_pong > Duration::from_secs(5) => {
                 self.health = HealthStatus::Disconnected
             }
@@ -95,21 +98,6 @@ enum HeartbeatRequest {
     Ping,
 }
 
-impl HeartbeatRequest {
-    pub fn new_message(src: NodeId, dst: NodeId) -> Message<Request<Self>> {
-        Message {
-            id: random(),
-            src,
-            dst,
-            body: Request {
-                message_id: random(),
-                traceparent: None,
-                payload: Self::Ping,
-            },
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum HeartbeatResponse {
@@ -119,18 +107,20 @@ enum HeartbeatResponse {
 pub async fn heartbeat_loop(period: Duration, network: Arc<Network>, rpc: Rpc) -> eyre::Result<()> {
     let (tx, mut rv) = channel(256);
 
-    let with_node = |me: NodeId,
+    let with_node = |_me: NodeId,
                      node: NodeId,
                      rpc: Rpc,
                      status: Sender<(NodeId, Option<Instant>)>| async move {
-        let req = || HeartbeatRequest::new_message(me.clone(), node.clone());
         let mut interval = tokio::time::interval(period);
         loop {
             interval.tick().await;
 
             let span = tracing::info_span!("Ping", %node);
             async {
-                match rpc.send::<_, HeartbeatResponse>(req()).await {
+                match rpc
+                    .send::<_, HeartbeatResponse>(node.clone(), HeartbeatRequest::Ping)
+                    .await
+                {
                     Ok(_) => {
                         let last_pong = Instant::now();
                         let _ = status.send((node.clone(), Some(last_pong))).await;
@@ -169,7 +159,7 @@ pub async fn heartbeat_loop(period: Duration, network: Arc<Network>, rpc: Rpc) -
         let mut nodes = network.nodes.write();
         let Some(pos) = nodes.iter().position(|n| n.id == node) else {
             tracing::error!(?node, "Received health check from non-existent node");
-            continue
+            continue;
         };
         if let Some(pong_received_at) = received_at {
             nodes[pos].set_alive(pong_received_at);

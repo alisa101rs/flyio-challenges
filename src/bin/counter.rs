@@ -1,6 +1,6 @@
 #![feature(async_fn_in_trait)]
-#![feature(hash_drain_filter)]
 #![feature(integer_atomics)]
+#![feature(hash_extract_if)]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,13 +14,11 @@ use std::{
 };
 
 use flyio_rs::{
-    azync::{event_loop, periodic_injection, Event, Node, Rpc},
-    network::Network,
-    setup_with_telemetry, Message, Request, Response,
+    event::Event, event_loop, network::Network, periodic_injection, trace::setup_with_telemetry,
+    Node, Rpc,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
-use rand::random;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
@@ -113,19 +111,19 @@ impl Hash for Delta {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<GrowCounter, RequestPayload, ResponsePayload>(None).await?;
+    event_loop::<GrowCounter, RequestPayload>(None).await?;
 
     Ok(())
 }
 
 #[derive(Debug, Clone)]
 struct GrowCounter {
-    network: Arc<Network>,
     myself: u64,
     ids: Arc<AtomicU64>,
     deltas: Arc<Mutex<HashSet<Delta>>>,
     commits: Arc<HashMap<SmolStr, AtomicU64>>,
     replications: Arc<HashMap<SmolStr, AtomicU64>>,
+    rpc: Rpc,
 }
 
 impl GrowCounter {
@@ -136,8 +134,8 @@ impl GrowCounter {
         }
     }
 
-    #[instrument(skip(self, rpc), err)]
-    async fn replicate(&self, rpc: &Rpc) -> eyre::Result<()> {
+    #[instrument(skip(self), err)]
+    async fn replicate(&self) -> eyre::Result<()> {
         let mut futures = FuturesUnordered::new();
         for (node, last_commit) in &*self.commits {
             let last_commit_from_n = last_commit.load(Ordering::Relaxed);
@@ -164,32 +162,16 @@ impl GrowCounter {
                 "Replicating deltas to other node"
             );
 
-            let message = Message {
-                id: 0,
-                src: self.network.id.clone(),
-                dst: node.clone(),
-                body: Request {
-                    message_id: random(),
-                    traceparent: None,
-                    payload: RequestPayload::Replicate {
-                        deltas,
-                        last_commit,
-                    },
-                },
+            let dst = node.clone();
+            let payload = RequestPayload::Replicate {
+                deltas,
+                last_commit,
             };
-            let rpc = rpc.clone();
+            let rpc = self.rpc.clone();
             let span = tracing::info_span!("Replication");
             futures.push(async move {
-                match rpc.send(message).instrument(span).await {
-                    Ok(Message {
-                        src,
-                        body:
-                            Response {
-                                payload: ResponsePayload::ReplicateOk,
-                                ..
-                            },
-                        ..
-                    }) => Some((src, last_commit)),
+                match rpc.send(dst.clone(), payload).instrument(span).await {
+                    Ok(ResponsePayload::ReplicateOk) => Some((dst, last_commit)),
                     _ => None,
                 }
             });
@@ -225,7 +207,7 @@ impl GrowCounter {
         let mut values = self.deltas.lock();
 
         let compressed: u64 = values
-            .drain_filter(|delta| delta.id.src != self.myself || delta.id.id <= last_commit)
+            .extract_if(|delta| delta.id.src != self.myself || delta.id.id <= last_commit)
             .map(|it| it.value)
             .sum();
 
@@ -236,11 +218,11 @@ impl GrowCounter {
 impl Node for GrowCounter {
     type Injected = Injected;
     type Request = RequestPayload;
-    type Response = ResponsePayload;
 
     fn from_init(
         network: Arc<Network>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
+        rpc: Rpc,
     ) -> eyre::Result<Self> {
         setup_with_telemetry(format!("counter-{}", network.id))?;
 
@@ -268,7 +250,7 @@ impl Node for GrowCounter {
             + 1;
 
         Ok(Self {
-            network,
+            rpc,
             myself,
             ids: Arc::new(AtomicU64::new(1)),
             deltas: Arc::new(Mutex::new(Default::default())),
@@ -277,23 +259,26 @@ impl Node for GrowCounter {
         })
     }
 
-    #[instrument(skip(self, rpc), err)]
+    #[instrument(skip(self), err)]
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc,
     ) -> eyre::Result<()> {
         match event {
             Event::Injected(Injected::Replicate) => {
-                self.replicate(&rpc).await?;
+                self.replicate().await?;
                 Ok(())
             }
             Event::Injected(Injected::Compress) => {
                 self.compress();
                 Ok(())
             }
-            Event::Request(message) => {
-                let payload = match message.body.payload {
+            Event::Request {
+                src,
+                message_id,
+                payload,
+            } => {
+                let payload = match payload {
                     RequestPayload::Add { delta } => {
                         if delta != 0 {
                             self.deltas.lock().insert(Delta::new(delta, self.next_id()));
@@ -306,16 +291,16 @@ impl Node for GrowCounter {
                         last_commit,
                     } => {
                         let mut my_deltas = self.deltas.lock();
-                        let last_replicate = self.replications[&message.src]
-                            .fetch_max(last_commit, Ordering::Relaxed);
+                        let last_replicate =
+                            self.replications[&src].fetch_max(last_commit, Ordering::Relaxed);
 
                         my_deltas.extend(deltas.iter().filter(|it| it.id.id > last_replicate));
 
                         ResponsePayload::ReplicateOk
                     }
                 };
-                let response = message.into_reply(|_| payload);
-                rpc.respond(response);
+
+                self.rpc.respond(src, message_id, payload);
 
                 Ok(())
             }

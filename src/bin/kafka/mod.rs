@@ -1,5 +1,4 @@
 #![feature(async_fn_in_trait)]
-#![feature(hash_drain_filter)]
 #![feature(integer_atomics)]
 
 use std::{
@@ -9,12 +8,10 @@ use std::{
 };
 
 use flyio_rs::{
-    azync::{event_loop, periodic_injection, Event, Node, Rpc},
-    network::Network,
-    setup_with_telemetry, Message, Request, Response,
+    event::Event, event_loop, network::Network, periodic_injection, trace::setup_with_telemetry, Node, Rpc,
 };
 use parking_lot::Mutex;
-use rand::random;
+
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
@@ -31,12 +28,11 @@ pub type Log = (Offset, u64);
 mod bucket;
 mod commit_table;
 mod leaders;
-mod partitions;
 mod write_log;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<KafkaLogNode, RequestPayload, ResponsePayload>(None).await?;
+    event_loop::<KafkaLogNode, RequestPayload>(None).await?;
 
     Ok(())
 }
@@ -107,6 +103,7 @@ struct KafkaLogNode {
     buckets: Arc<Mutex<HashMap<SmolStr, LogBucket>>>,
     commits: Arc<CommitTable>,
     write_log: Arc<WriteLog>,
+    rpc: Rpc,
 }
 
 impl KafkaLogNode {
@@ -137,30 +134,18 @@ impl KafkaLogNode {
         offset
     }
 
-    #[instrument(skip(self, rpc), ret)]
-    async fn send(&self, key: Key, message: u64, rpc: &Rpc) -> ResponsePayload {
+    #[instrument(skip(self), ret)]
+    async fn send(&self, key: Key, message: u64) -> ResponsePayload {
         let node = self.topic_leaders.get_or_insert(&key).await;
         if node == self.network.id {
             let offset = self.create_write(key, message).await;
 
             ResponsePayload::SendOk { offset }
         } else {
-            let request = Message {
-                id: 0,
-                src: self.network.id.clone(),
-                dst: node,
-                body: Request {
-                    payload: RequestPayload::Send { key, message },
-                    message_id: random(),
-                    traceparent: None,
-                },
-            };
+            let request = RequestPayload::Send { key, message };
 
-            match rpc.send(request).await {
-                Ok(Message {
-                    body: Response { payload, .. },
-                    ..
-                }) => payload,
+            match self.rpc.send(node, request).await {
+                Ok(payload) => payload,
                 _ => {
                     panic!("can't handle")
                 }
@@ -196,9 +181,9 @@ impl KafkaLogNode {
         }
     }
 
-    #[instrument(skip(self, rpc))]
-    async fn init_propagate_writes(&self, rpc: Rpc) {
-        let messages = self.write_log.propagate_writes(rpc.clone()).await;
+    #[instrument(skip(self))]
+    async fn init_propagate_writes(&self) {
+        let messages = self.write_log.propagate_writes(self.rpc.clone()).await;
         let mut buckets = self.buckets.lock();
         for (key, logs) in messages {
             buckets.get_mut(&key).expect("not possible").insert(logs);
@@ -217,11 +202,11 @@ impl KafkaLogNode {
 impl Node for KafkaLogNode {
     type Injected = Injected;
     type Request = RequestPayload;
-    type Response = ResponsePayload;
 
     fn from_init(
         network: Arc<Network>,
         tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
+        rpc: Rpc,
     ) -> eyre::Result<Self> {
         setup_with_telemetry(format!("kafka-{}", network.id))?;
 
@@ -242,27 +227,31 @@ impl Node for KafkaLogNode {
             commits: Arc::new(commits),
             write_log: Arc::new(write_log),
             network,
+            rpc,
         })
     }
 
-    #[instrument(skip(self, rpc), err)]
+    #[instrument(skip(self), err)]
     async fn process_event(
         &mut self,
         event: Event<Self::Request, Self::Injected>,
-        rpc: Rpc,
     ) -> eyre::Result<()> {
         match event {
             Event::Injected(Injected::GossipCommits) => {
-                self.commits.clone().gossip_commits(&rpc);
+                self.commits.clone().gossip_commits(&self.rpc);
             }
             Event::Injected(Injected::PropagateWrites) => {
-                self.init_propagate_writes(rpc).await;
+                self.init_propagate_writes().await;
             }
             Event::EOF => {}
-            Event::Request(message) => {
-                let payload = match message.body.payload {
+            Event::Request {
+                src,
+                message_id,
+                payload,
+            } => {
+                let payload = match payload {
                     RequestPayload::Send { ref key, message } => {
-                        self.send(key.clone(), message, &rpc).await
+                        self.send(key.clone(), message).await
                     }
                     RequestPayload::Poll { ref offsets } => self.poll(offsets),
                     RequestPayload::CommitOffsets { offsets } => self.commit_offsets(offsets),
@@ -270,7 +259,7 @@ impl Node for KafkaLogNode {
                         self.list_committed_offsets(keys)
                     }
                     RequestPayload::GossipCommits { commits } => {
-                        self.commits.accept_gossip_commits(&message.src, commits);
+                        self.commits.accept_gossip_commits(&src, commits);
                         ResponsePayload::GossipCommitsOk
                     }
                     RequestPayload::PropagateWrites { messages } => self.propagate_writes(messages),
@@ -280,16 +269,7 @@ impl Node for KafkaLogNode {
                     }
                 };
 
-                let response = Message {
-                    id: message.id,
-                    src: message.dst,
-                    dst: message.src,
-                    body: Response {
-                        in_reply_to: message.body.message_id,
-                        payload,
-                    },
-                };
-                rpc.respond(response);
+                self.rpc.respond(src, message_id, payload);
             }
         }
 

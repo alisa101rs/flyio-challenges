@@ -1,17 +1,27 @@
 #![feature(async_fn_in_trait)]
 
-pub mod azync;
+pub mod event;
+mod mailbox;
 pub mod network;
-pub mod sync;
+mod node;
+mod output;
+mod rpc;
+pub mod trace;
 
-use std::{
-    io::{stdin, stdout, Write},
-    time::Duration,
-};
+use std::io::stdin;
 
 use eyre::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use smol_str::SmolStr;
+
+pub use self::{
+    mailbox::{launch_mailbox_loop, Mailbox},
+    network::NodeId,
+    node::{event_loop, periodic_injection, Node},
+    output::Output,
+    rpc::Rpc,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Message<Body> {
@@ -23,33 +33,33 @@ pub struct Message<Body> {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Request<Payload> {
+pub struct Request {
     #[serde(rename = "msg_id")]
     pub message_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
     #[serde(flatten)]
-    pub payload: Payload,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Response<Payload> {
+pub struct Response {
     pub in_reply_to: u64,
     #[serde(flatten)]
-    pub payload: Payload,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum RequestOrResponse<Req, Res> {
-    Request(Request<Req>),
-    Response(Response<Res>),
+pub enum RequestOrResponse {
+    Request(Request),
+    Response(Response),
 }
 
-impl<Rq> Message<Request<Rq>> {
-    pub fn into_reply<Rs, F>(self, f: F) -> Message<Response<Rs>>
+impl Message<Request> {
+    pub fn into_reply<F, E>(self, f: F) -> Result<Message<Response>, E>
     where
-        F: FnOnce(Rq) -> Rs,
+        F: FnOnce(Value) -> Result<Value, E>,
     {
         let Message {
             id, src, dst, body, ..
@@ -60,22 +70,22 @@ impl<Rq> Message<Request<Rq>> {
             ..
         } = body;
 
-        Message {
+        Ok(Message {
             id,
             src: dst,
             dst: src,
             body: Response {
                 in_reply_to: message_id,
-                payload: f(payload),
+                payload: f(payload)?,
             },
-        }
+        })
     }
 }
 
-impl<Res> Message<Response<Res>> {
-    pub fn try_map_payload<NewRes, F, E>(self, f: F) -> Result<Message<Response<NewRes>>, E>
+impl Message<Response> {
+    pub fn try_map_payload<F, E>(self, f: F) -> Result<Message<Response>, E>
     where
-        F: FnOnce(Res) -> Result<NewRes, E>,
+        F: FnOnce(Value) -> Result<Value, E>,
     {
         let Message {
             id, src, dst, body, ..
@@ -116,111 +126,38 @@ fn initialize() -> Result<(SmolStr, Vec<SmolStr>)> {
     let mut init = String::new();
     stdin().read_line(&mut init)?;
 
-    let message: Message<Request<InitRequestPayload>> = serde_json::de::from_str(&init)?;
+    let message: Message<Request> = serde_json::de::from_str(&init)?;
 
     tracing::debug!(?message, "Initialize message");
 
-    let Message { body, .. } = &message;
+    let Message {
+        id,
+        body: Request {
+            message_id,
+            payload,
+            ..
+        },
+        src,
+        ..
+    } = message;
 
-    let selv = match &body.payload {
-        InitRequestPayload::Init { node_id, node_ids } => (node_id.clone(), node_ids.clone()),
+    let payload: InitRequestPayload = serde_json::value::from_value(payload)?;
+
+    let selv = match payload {
+        InitRequestPayload::Init { node_id, node_ids } => (node_id, node_ids),
     };
-    let response = message.into_reply(|_payload| InitResponsePayload::InitOk);
+    let response = Message {
+        id,
+        dst: src,
+        src: selv.0.clone(),
+        body: Response {
+            in_reply_to: message_id,
+            payload: serde_json::to_value(InitResponsePayload::InitOk)?,
+        },
+    };
     Output::lock().write(Some(response));
 
     tracing::info!(node = ?selv, "Node initialized");
 
     Ok(selv)
-}
-
-#[derive(Copy, Clone)]
-pub struct Output {}
-
-impl Output {
-    pub fn lock() -> Self {
-        Self {}
-    }
-
-    pub fn write<R>(&self, iter: impl IntoIterator<Item = R>)
-    where
-        R: Serialize + std::fmt::Debug,
-    {
-        let mut stdout = stdout().lock();
-        for message in iter {
-            serde_json::ser::to_writer(&mut stdout, &message).expect("failed to write to stdout");
-            stdout.write(b"\n").expect("failed to write new line");
-        }
-    }
-}
-
-pub fn setup_tracing() -> eyre::Result<()> {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(std::io::stderr);
-    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_new("debug"))?;
-
-    tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(fmt_layer)
-        .init();
-
-    Ok(())
-}
-
-pub fn setup_with_telemetry(node: String) -> eyre::Result<()> {
-    use opentelemetry::{
-        runtime::Tokio,
-        sdk::{
-            propagation::TraceContextPropagator,
-            trace,
-            trace::{RandomIdGenerator, Sampler},
-            Resource,
-        },
-        KeyValue,
-    };
-    use opentelemetry_otlp::WithExportConfig;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(std::io::stderr);
-
-    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_new("debug"))?;
-
-    let registry = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(fmt_layer);
-
-    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
-    let endpoint = "http://0.0.0.0:4317";
-
-    let tracer = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(endpoint)
-                .with_timeout(Duration::from_secs(3)),
-        )
-        .with_trace_config(
-            trace::config()
-                .with_sampler(Sampler::AlwaysOn)
-                .with_id_generator(RandomIdGenerator::default())
-                .with_max_events_per_span(64)
-                .with_max_attributes_per_span(32)
-                .with_max_events_per_span(16)
-                .with_max_attributes_per_link(512)
-                .with_resource(Resource::new(vec![KeyValue::new("service.name", node)])),
-        )
-        .install_batch(Tokio)?;
-
-    registry
-        .with(tracing_opentelemetry::layer().with_tracer(tracer))
-        .try_init()?;
-
-    Ok(())
 }

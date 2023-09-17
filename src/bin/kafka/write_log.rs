@@ -4,9 +4,9 @@ use std::{
     sync::Arc,
 };
 
-use flyio_rs::{azync::Rpc, network::Network, Message, Request};
+use flyio_rs::{network::Network, Rpc};
 use parking_lot::Mutex;
-use rand::random;
+
 use tracing::instrument;
 
 use crate::{Key, Offset, RequestPayload, ResponsePayload};
@@ -48,40 +48,22 @@ impl WriteLog {
         }
 
         for node in self.network.other_nodes() {
-            let message = Message {
-                id: 0,
-                src: self.network.id.clone(),
-                dst: node,
-                body: Request {
-                    message_id: random(),
-                    payload: RequestPayload::PropagateWrites {
-                        messages: messages.clone(),
-                    },
-                    traceparent: None,
-                },
+            let message = RequestPayload::PropagateWrites {
+                messages: messages.clone(),
             };
 
-            if let Ok(_response) = rpc.send::<_, ResponsePayload>(message).await {
+            if let Ok(_response) = rpc.send::<_, ResponsePayload>(node, message).await {
             } else {
                 unimplemented!("Unacknowledged write")
             }
         }
 
         for node in self.network.other_nodes() {
-            let message = Message {
-                id: 0,
-                src: self.network.id.clone(),
-                dst: node,
-                body: Request {
-                    message_id: random(),
-                    payload: RequestPayload::AcknowledgeWrites {
-                        offsets: offsets.clone(),
-                    },
-                    traceparent: None,
-                },
+            let message = RequestPayload::AcknowledgeWrites {
+                offsets: offsets.clone(),
             };
 
-            if let Ok(_response) = rpc.send::<_, ResponsePayload>(message).await {
+            if let Ok(_response) = rpc.send::<_, ResponsePayload>(node, message).await {
             } else {
                 unimplemented!("Unacknowledged acknowledge")
             }
