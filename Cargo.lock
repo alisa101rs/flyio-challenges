@@ -323,6 +323,7 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "vclock",
 ]
 
 [[package]]
@@ -1593,6 +1594,15 @@ name = "valuable"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
+
+[[package]]
+name = "vclock"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d05c20cbe48ad2964f9ca15e533493503819202ab6e05f2deb7a98e1741ed4d"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "want"

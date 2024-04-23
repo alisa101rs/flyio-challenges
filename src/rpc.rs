@@ -2,12 +2,13 @@ use std::time::Duration;
 
 use derivative::Derivative;
 use eyre::{eyre, Context, Result};
+use futures::{stream::FuturesUnordered, Stream};
 use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
-use tracing::{instrument};
+use tracing::instrument;
 
 pub use super::Mailbox;
-use crate::{trace::inject_trace, Message, NodeId, Request, Response};
+use crate::{network::Network, trace::inject_trace, Message, NodeId, Request, Response};
 
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
@@ -41,6 +42,26 @@ impl Rpc {
             },
         };
         self.mailbox.output.write(Some(message));
+    }
+
+    pub fn broadcast<'a, Req, Res>(
+        &'a self,
+        network: &Network,
+        payload: Req,
+    ) -> impl Stream<Item = Result<(NodeId, Res)>> + Send + Sync + 'a
+    where
+        Req: Serialize + Clone + std::fmt::Debug + Sync + Send + 'static,
+        Res: DeserializeOwned + std::fmt::Debug + Sync + Send + 'static,
+    {
+        let mut futures = FuturesUnordered::new();
+
+        for dst in network.other_nodes() {
+            let response = self.send(dst.clone(), payload.clone());
+
+            futures.push(async move { Ok((dst, response.await?)) });
+        }
+
+        futures
     }
 
     #[instrument(skip(self, payload), err)]

@@ -15,7 +15,7 @@ pub type NodeId = SmolStr;
 
 #[derive(Debug)]
 pub struct Network {
-    pub id: SmolStr,
+    pub id: NodeId,
     nodes: RwLock<Vec<Node>>,
 }
 

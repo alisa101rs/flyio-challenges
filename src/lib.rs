@@ -5,7 +5,9 @@ mod mailbox;
 pub mod network;
 mod node;
 mod output;
+mod routing;
 mod rpc;
+pub mod storage;
 pub mod trace;
 
 use std::io::stdin;
@@ -36,10 +38,10 @@ pub struct Message<Body> {
 pub struct Request {
     #[serde(rename = "msg_id")]
     pub message_id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
     #[serde(flatten)]
     pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
