@@ -16,6 +16,10 @@ impl Output {
     {
         let mut stdout = stdout().lock();
         for message in iter {
+            tracing::debug!(
+                message = serde_json::ser::to_string(&message).unwrap(),
+                "Writing"
+            );
             serde_json::ser::to_writer(&mut stdout, &message).expect("failed to write to stdout");
             stdout.write(b"\n").expect("failed to write new line");
         }

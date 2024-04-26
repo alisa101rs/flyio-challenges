@@ -1,31 +1,27 @@
 use std::{collections::HashMap, sync::Arc};
 
-use flyio_rs::{
-    network::{Network, NodeId}, Rpc,
-};
+use flyio_rs::{network::NodeId, Rpc};
 use futures::{stream::FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
+use serde::de::IgnoredAny;
 use tracing::{info_span, instrument, Instrument};
 
-use crate::{Key, Offset, RequestPayload, ResponsePayload};
+use crate::{GossipCommits, Key, Offset};
 
 #[derive(Debug)]
 pub struct CommitTable {
-    network: Arc<Network>,
     commits: Mutex<HashMap<Key, Offset>>,
     known: HashMap<NodeId, Arc<Mutex<HashMap<Key, Offset>>>>,
 }
 
 impl CommitTable {
-    pub fn new(network: Arc<Network>) -> Self {
-        let known = network
-            .other_nodes()
+    pub fn new(peers: &[NodeId]) -> Self {
+        let known = peers
             .iter()
             .map(|node| (node.clone(), Arc::new(Mutex::new(Default::default()))))
             .collect();
         Self {
             commits: Mutex::new(Default::default()),
-            network,
             known,
         }
     }
@@ -41,7 +37,6 @@ impl CommitTable {
             .collect()
     }
 
-    #[instrument(skip(self))]
     pub fn accept_gossip_commits(&self, from: &NodeId, incoming_commits: HashMap<Key, Offset>) {
         let mut commits = self.commits.lock();
         let known = self.known.get(from).unwrap();
@@ -57,7 +52,7 @@ impl CommitTable {
     }
 
     #[instrument(skip(self, rpc))]
-    pub fn gossip_commits(self: Arc<Self>, rpc: &Rpc) {
+    pub async fn gossip_commits(&self, rpc: &Rpc) {
         let mut futures = FuturesUnordered::new();
 
         for (dst, maybe_known_to) in self.known.iter() {
@@ -87,34 +82,32 @@ impl CommitTable {
                     continue;
                 }
 
-                tracing::debug!(gossips = ?notify, "Sending gossip");
-                let message = RequestPayload::GossipCommits {
+                let message = GossipCommits {
                     commits: notify.clone(),
                 };
 
                 (message, notify)
             };
+            let span = info_span!("Gossiping Commits", gossips = ?notify, %dst);
 
             let dst = dst.clone();
             let rpc = rpc.clone();
-            let span = info_span!("Gossiping Commits");
+
             let known_to = maybe_known_to.clone();
             futures.push(
                 async move {
-                    if let Ok(payload) = rpc.send(dst, message).await {
-                        match payload {
-                            ResponsePayload::GossipCommitsOk => {
-                                let mut known_to = known_to.lock();
-                                known_to.extend(notify.into_iter());
-                            }
-                            _ => unreachable!(),
-                        }
+                    if let Ok(_) = rpc
+                        .send::<_, IgnoredAny>("gossip_commits", dst, message)
+                        .await
+                    {
+                        let mut known_to = known_to.lock();
+                        known_to.extend(notify.into_iter());
                     }
                 }
                 .instrument(span),
             );
         }
 
-        tokio::task::spawn(async move { while (futures.next().await).is_some() {} });
+        while (futures.next().await).is_some() {}
     }
 }

@@ -1,66 +1,25 @@
-#![feature(async_fn_in_trait)]
-
-use std::sync::Arc;
-
-use flyio_rs::{
-    event::Event, event_loop, network::Network, trace::setup_tracing, Node, Rpc,
-};
+use flyio_rs::{request::Payload, routing::Router, serve, setup_network, trace::setup_tracing};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RequestPayload {
-    Echo { echo: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponsePayload {
-    EchoOk { echo: String },
+pub struct Echo {
+    echo: String,
 }
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     setup_tracing()?;
+    let (_, rpc, messages) = setup_network().await?;
 
-    event_loop::<EchoNode, RequestPayload>(None).await?;
+    let router = Router::new().route("echo", echo);
+
+    serve(router, rpc, messages).await?;
 
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct EchoNode(Rpc);
+async fn echo(Payload(echo): Payload<Echo>) -> Payload<Echo> {
+    tracing::debug!("Got an echo");
 
-impl Node for EchoNode {
-    type Injected = ();
-    type Request = RequestPayload;
-
-    fn from_init(
-        _network: Arc<Network>,
-        _tx: Sender<Event<Self::Request, Self::Injected>>,
-        rpc: Rpc,
-    ) -> eyre::Result<Self> {
-        Ok(Self(rpc))
-    }
-
-    async fn process_event(
-        &mut self,
-        event: Event<Self::Request, Self::Injected>,
-    ) -> eyre::Result<()> {
-        match event {
-            Event::Request {
-                src,
-                message_id,
-                payload: RequestPayload::Echo { echo },
-            } => {
-                self.0
-                    .respond(src, message_id, ResponsePayload::EchoOk { echo });
-            }
-            Event::Injected(_) => {}
-            Event::EOF => {}
-        }
-
-        Ok(())
-    }
+    Payload(echo)
 }

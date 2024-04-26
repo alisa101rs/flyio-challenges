@@ -1,14 +1,20 @@
 use std::time::Duration;
 
 use derivative::Derivative;
-use eyre::{eyre, Context, Result};
+use eyre::{eyre, Result};
 use futures::{stream::FuturesUnordered, Stream};
 use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
+use smol_str::SmolStr;
 use tracing::instrument;
 
 pub use super::Mailbox;
-use crate::{network::Network, trace::inject_trace, Message, NodeId, Request, Response};
+use crate::{
+    message::{Message, RequestPayload, ResponsePayload},
+    network::Network,
+    trace::inject_trace,
+    NodeId,
+};
 
 #[derive(Clone, Derivative)]
 #[derivative(Debug)]
@@ -20,6 +26,12 @@ pub struct Rpc {
 }
 
 impl Rpc {
+    pub fn node_id(&self) -> NodeId {
+        self.node.clone()
+    }
+    pub fn peers(&self) -> &[NodeId] {
+        self.peers.as_slice()
+    }
     pub fn new(node: NodeId, peers: Vec<NodeId>, mailbox: Mailbox) -> Self {
         Self {
             node,
@@ -28,7 +40,7 @@ impl Rpc {
         }
     }
 
-    pub fn respond<Res>(&self, to: NodeId, message_id: u64, payload: Res)
+    pub fn respond<Res>(&self, to: NodeId, ty: String, message_id: u64, payload: Res)
     where
         Res: Serialize + std::fmt::Debug,
     {
@@ -36,16 +48,19 @@ impl Rpc {
             id: random(),
             src: self.node.clone(),
             dst: to,
-            body: Response {
+            body: ResponsePayload {
                 in_reply_to: message_id,
+                ty,
                 payload: serde_json::to_value(payload).expect("Could not serialize payload"),
             },
         };
-        self.mailbox.output.write(Some(message));
+        tracing::debug!(?message, "Responding");
+        self.mailbox.respond(message);
     }
 
     pub fn broadcast<'a, Req, Res>(
         &'a self,
+        ty: impl Into<SmolStr>,
         network: &Network,
         payload: Req,
     ) -> impl Stream<Item = Result<(NodeId, Res)>> + Send + Sync + 'a
@@ -53,10 +68,11 @@ impl Rpc {
         Req: Serialize + Clone + std::fmt::Debug + Sync + Send + 'static,
         Res: DeserializeOwned + std::fmt::Debug + Sync + Send + 'static,
     {
-        let mut futures = FuturesUnordered::new();
+        let futures = FuturesUnordered::new();
+        let ty = ty.into();
 
         for dst in network.other_nodes() {
-            let response = self.send(dst.clone(), payload.clone());
+            let response = self.send(ty.clone(), dst.clone(), payload.clone());
 
             futures.push(async move { Ok((dst, response.await?)) });
         }
@@ -64,8 +80,12 @@ impl Rpc {
         futures
     }
 
-    #[instrument(skip(self, payload), err)]
-    pub async fn send<Req, Res>(&self, dst: NodeId, payload: Req) -> Result<Res>
+    pub async fn send<Req, Res>(
+        &self,
+        ty: impl Into<SmolStr> + std::fmt::Debug,
+        dst: NodeId,
+        payload: Req,
+    ) -> Result<Res>
     where
         Req: Serialize + std::fmt::Debug,
         Res: DeserializeOwned + std::fmt::Debug,
@@ -76,10 +96,11 @@ impl Rpc {
                 id,
                 src: self.node.clone(),
                 dst,
-                body: Request {
+                body: RequestPayload {
                     message_id: id,
                     traceparent: None,
                     payload: serde_json::to_value(payload)?,
+                    ty: ty.into(),
                 },
             })
             .await?;
@@ -87,16 +108,16 @@ impl Rpc {
         serde_json::from_value(response.body.payload).map_err(|er| eyre!("Invalid response {er}"))
     }
 
-    #[instrument(skip(self, req))]
-    async fn send_message(&self, mut req: Message<Request>) -> Result<Message<Response>> {
+    #[instrument(skip(self), err)]
+    async fn send_message(
+        &self,
+        mut req: Message<RequestPayload>,
+    ) -> Result<Message<ResponsePayload>> {
         inject_trace(&mut req);
-        tracing::debug!(request = ?req, "Sending request");
         let rv = self.mailbox.send(req);
 
         match tokio::time::timeout(Duration::from_millis(250), rv).await {
-            Ok(Ok(res)) => res
-                .try_map_payload(serde_json::from_value)
-                .wrap_err(eyre!("could not deserialize response")),
+            Ok(Ok(res)) => Ok(res),
             Ok(Err(er)) => {
                 tracing::error!(?er, "Could not receive response");
                 Err(eyre!("Error: {er:?}"))

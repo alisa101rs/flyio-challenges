@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
     marker::PhantomData,
     sync::Arc,
@@ -31,6 +31,7 @@ pub trait Transaction<'a, K: Hash + Eq + PartialEq, V: Clone> {
 #[derive(Clone)]
 pub struct DashVector<K, V> {
     storage: Arc<DashMap<K, KeyEntries<V>>>,
+    #[allow(dead_code)]
     active_transactions: Arc<Mutex<HashSet<TransactionId>>>,
 }
 

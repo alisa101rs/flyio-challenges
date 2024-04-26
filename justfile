@@ -34,15 +34,15 @@ unique_id:
 
 broadcast-3a:
     cargo build --bin broadcast
-    ./maelstrom test -w broadcast --bin ./target/debug/broadcast_async --node-count 1 --time-limit 5 --rate 20
+    ./maelstrom test -w broadcast --bin ./target/debug/broadcast --node-count 1 --time-limit 5 --rate 20
 
 broadcast-3b:
     cargo build --bin broadcast
-    ./maelstrom test -w broadcast --bin ./target/debug/broadcast_async --node-count 5 --time-limit 20 --rate 10
+    ./maelstrom test -w broadcast --bin ./target/debug/broadcast --node-count 5 --time-limit 20 --rate 10
 
 broadcast-3c:
     cargo build --bin broadcast --release
-    ./maelstrom test -w broadcast --bin ./target/release/broadcast_async --node-count 5 --time-limit 30 --rate 100 --nemesis partition
+    ./maelstrom test -w broadcast --bin ./target/release/broadcast --node-count 5 --time-limit 30 --rate 100 --nemesis partition
 
 broadcast-3d:
     cargo build --bin broadcast --release
@@ -50,7 +50,7 @@ broadcast-3d:
 
 broadcast-3e:
     cargo build --bin broadcast --release
-    ./maelstrom test -w broadcast --bin ./target/release/broadcast_async --node-count 25 --time-limit 20 --rate 100 --latency 100
+    ./maelstrom test -w broadcast --bin ./target/release/broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100
 
 counter-4o:
     cargo build --bin counter
@@ -61,8 +61,8 @@ counter-4a:
     ./maelstrom test -w g-counter --bin ./target/release/counter --node-count 3 --time-limit 20 --rate 100
 
 counter-4b:
-    cargo build --bin counter
-    ./maelstrom test -w g-counter --bin ./target/debug/counter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+    cargo build --bin counter --release
+    ./maelstrom test -w g-counter --bin ./target/release/counter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
 
 kafka-5o:
      cargo build --bin kafka

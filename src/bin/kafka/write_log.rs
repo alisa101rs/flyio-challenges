@@ -6,10 +6,10 @@ use std::{
 
 use flyio_rs::{network::Network, Rpc};
 use parking_lot::Mutex;
-
+use serde::de::IgnoredAny;
 use tracing::instrument;
 
-use crate::{Key, Offset, RequestPayload, ResponsePayload};
+use crate::{AcknowledgeWrites, Key, Offset, PropagateWrites};
 
 #[derive(Debug)]
 pub struct WriteLog {
@@ -48,22 +48,28 @@ impl WriteLog {
         }
 
         for node in self.network.other_nodes() {
-            let message = RequestPayload::PropagateWrites {
+            let message = PropagateWrites {
                 messages: messages.clone(),
             };
 
-            if let Ok(_response) = rpc.send::<_, ResponsePayload>(node, message).await {
+            if let Ok(_response) = rpc
+                .send::<_, IgnoredAny>("propagate_writes", node, message)
+                .await
+            {
             } else {
                 unimplemented!("Unacknowledged write")
             }
         }
 
         for node in self.network.other_nodes() {
-            let message = RequestPayload::AcknowledgeWrites {
+            let message = AcknowledgeWrites {
                 offsets: offsets.clone(),
             };
 
-            if let Ok(_response) = rpc.send::<_, ResponsePayload>(node, message).await {
+            if let Ok(_response) = rpc
+                .send::<_, IgnoredAny>("acknowledge_writes", node, message)
+                .await
+            {
             } else {
                 unimplemented!("Unacknowledged acknowledge")
             }

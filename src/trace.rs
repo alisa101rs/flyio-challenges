@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use opentelemetry::propagation::Injector;
-use tracing::{info_span, Span};
+use tracing::Span;
 
-use crate::{event::Event, Message, Request};
+use crate::message::{Message, RequestPayload};
 
 pub fn setup_tracing() -> eyre::Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -77,14 +77,8 @@ pub fn setup_with_telemetry(node: String) -> eyre::Result<()> {
     Ok(())
 }
 
-pub(crate) fn get_span<R, I>(event: &Event<R, I>, parent: Option<String>) -> Span {
-    let span = match event {
-        Event::Request { .. } => info_span!("Request event"),
-        Event::Injected(_) => info_span!("Injected event"),
-        Event::EOF => info_span!("EOF event"),
-    };
-    tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(&span, extract_remote_context(parent));
-    span
+pub(crate) fn inject_parent(span: &Span, parent: Option<String>) {
+    tracing_opentelemetry::OpenTelemetrySpanExt::set_parent(span, extract_remote_context(parent));
 }
 
 pub(crate) fn extract_remote_context(parent: Option<String>) -> opentelemetry::Context {
@@ -108,10 +102,10 @@ pub(crate) fn extract_remote_context(parent: Option<String>) -> opentelemetry::C
     opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor))
 }
 
-pub(crate) fn inject_trace(message: &mut Message<Request>) {
+pub(crate) fn inject_trace(message: &mut Message<RequestPayload>) {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-    struct MessageInjector<'a>(&'a mut Message<Request>);
+    struct MessageInjector<'a>(&'a mut Message<RequestPayload>);
 
     let mut inj = MessageInjector(message);
 

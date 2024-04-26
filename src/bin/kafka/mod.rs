@@ -1,6 +1,3 @@
-#![feature(async_fn_in_trait)]
-#![feature(integer_atomics)]
-
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
@@ -8,13 +5,17 @@ use std::{
 };
 
 use flyio_rs::{
-    event::Event, event_loop, network::Network, periodic_injection, trace::setup_with_telemetry, Node, Rpc,
+    network::Network,
+    request::{Extension, Payload},
+    response::IntoResponse,
+    routing::Router,
+    serve, setup_network,
+    trace::setup_with_telemetry,
+    NodeId, Rpc,
 };
 use parking_lot::Mutex;
-
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crate::{
@@ -32,62 +33,160 @@ mod write_log;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<KafkaLogNode, RequestPayload>(None).await?;
+    let (network, rpc, messages) = setup_network().await?;
+    setup_with_telemetry(format!("kafka-{}", network.id))?;
+    let kafka = KafkaLogNode::create(network.clone());
+
+    let router = Router::new()
+        .route("send", send)
+        .route("poll", poll)
+        .route("commit_offsets", commit)
+        .route("list_committed_offsets", list_committed)
+        .route("gossip_commits", gossip_commits)
+        .route("propagate_writes", propagate_writes)
+        .route("acknowledge_writes", acknowledge_writes)
+        .layer(Extension(kafka.clone()))
+        .layer(Extension(network))
+        .layer(Extension(rpc.clone()));
+
+    tokio::spawn(start_gossiping_commits(kafka.clone(), rpc.clone()));
+    tokio::spawn(start_write_propagation(kafka, rpc.clone()));
+
+    serve(router, rpc, messages).await?;
 
     Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RequestPayload {
-    Send {
-        key: SmolStr,
-        #[serde(rename = "msg")]
-        message: u64,
-    },
-    Poll {
-        offsets: HashMap<SmolStr, Offset>,
-    },
-    CommitOffsets {
-        offsets: HashMap<SmolStr, Offset>,
-    },
-    ListCommittedOffsets {
-        keys: Vec<SmolStr>,
-    },
-    GossipCommits {
-        commits: HashMap<SmolStr, Offset>,
-    },
-    PropagateWrites {
-        messages: HashMap<Key, BTreeSet<(Offset, u64)>>,
-    },
-    AcknowledgeWrites {
-        offsets: HashMap<Key, Offset>,
-    },
+struct SendRequest {
+    key: SmolStr,
+    #[serde(rename = "msg")]
+    message: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponsePayload {
-    SendOk {
-        offset: u64,
-    },
-    PollOk {
-        #[serde(rename = "msgs")]
-        messages: HashMap<SmolStr, Vec<Log>>,
-    },
-    CommitOffsetsOk,
-    ListCommittedOffsetsOk {
-        offsets: HashMap<SmolStr, Offset>,
-    },
-    GossipCommitsOk,
-    AcknowledgeWritesOk,
-    PropagateWritesOk,
+struct SendResponse {
+    offset: u64,
 }
 
-#[derive(Debug, Clone)]
-pub enum Injected {
-    GossipCommits,
-    PropagateWrites,
+#[instrument(skip(kafka, rpc), ret)]
+async fn send(
+    Extension(kafka): Extension<KafkaLogNode>,
+    Extension(rpc): Extension<Rpc>,
+    Payload(message): Payload<SendRequest>,
+) -> impl IntoResponse {
+    let offset = kafka.send(message.key, message.message, rpc).await;
+    Payload(SendResponse { offset })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PollRequest {
+    offsets: HashMap<SmolStr, Offset>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PollResponse {
+    #[serde(rename = "msgs")]
+    messages: HashMap<SmolStr, Vec<Log>>,
+}
+
+#[instrument(skip(kafka), ret)]
+async fn poll(
+    Extension(kafka): Extension<KafkaLogNode>,
+    Payload(offsets): Payload<PollRequest>,
+) -> impl IntoResponse {
+    Payload(PollResponse {
+        messages: kafka.poll(&offsets.offsets),
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CommitOffsets {
+    offsets: HashMap<SmolStr, Offset>,
+}
+
+#[instrument(skip(kafka))]
+async fn commit(
+    Extension(kafka): Extension<KafkaLogNode>,
+    Payload(offsets): Payload<CommitOffsets>,
+) {
+    kafka.commit_offsets(offsets.offsets);
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ListCommittedOffsets {
+    keys: Vec<SmolStr>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CommittedOffsets {
+    offsets: HashMap<SmolStr, Offset>,
+}
+
+#[instrument(skip(kafka), ret)]
+async fn list_committed(
+    Extension(kafka): Extension<KafkaLogNode>,
+    Payload(keys): Payload<ListCommittedOffsets>,
+) -> impl IntoResponse {
+    Payload(CommittedOffsets {
+        offsets: kafka.list_committed_offsets(keys.keys.as_slice()),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GossipCommits {
+    commits: HashMap<SmolStr, Offset>,
+}
+
+#[instrument(skip(kafka))]
+async fn gossip_commits(
+    from: NodeId,
+    Extension(kafka): Extension<KafkaLogNode>,
+    Payload(gossips): Payload<GossipCommits>,
+) {
+    kafka.commits.accept_gossip_commits(&from, gossips.commits);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PropagateWrites {
+    messages: HashMap<Key, BTreeSet<(Offset, u64)>>,
+}
+
+#[instrument(skip(kafka))]
+async fn propagate_writes(
+    Extension(kafka): Extension<KafkaLogNode>,
+    Payload(writes): Payload<PropagateWrites>,
+) {
+    kafka.propagate_writes(writes.messages);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AcknowledgeWrites {
+    offsets: HashMap<Key, Offset>,
+}
+
+#[instrument(skip(kafka))]
+async fn acknowledge_writes(
+    Extension(kafka): Extension<KafkaLogNode>,
+    Payload(writes): Payload<AcknowledgeWrites>,
+) {
+    kafka.acknowledge_writes(writes.offsets);
+}
+
+async fn start_gossiping_commits(kafka: KafkaLogNode, rpc: Rpc) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        ticker.tick().await;
+        kafka.commits.gossip_commits(&rpc).await;
+    }
+}
+
+async fn start_write_propagation(kafka: KafkaLogNode, rpc: Rpc) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(1000));
+    loop {
+        ticker.tick().await;
+        kafka.init_propagate_writes(&rpc).await;
+    }
 }
 
 /// KafkaLogNode
@@ -98,17 +197,29 @@ pub enum Injected {
 /// - `send` will be redirected to the leader
 #[derive(Debug, Clone)]
 struct KafkaLogNode {
-    network: Arc<Network>,
+    id: NodeId,
     topic_leaders: Arc<TopicLeaders>,
     buckets: Arc<Mutex<HashMap<SmolStr, LogBucket>>>,
     commits: Arc<CommitTable>,
     write_log: Arc<WriteLog>,
-    rpc: Rpc,
 }
 
 impl KafkaLogNode {
-    #[instrument(skip(self,))]
-    fn propagate_writes(&self, messages: HashMap<Key, BTreeSet<(Offset, u64)>>) -> ResponsePayload {
+    fn create(network: Arc<Network>) -> Self {
+        let topic_leaders = TopicLeaders::simple(network.clone());
+        let commits = CommitTable::new(&network.other_nodes());
+        let write_log = WriteLog::new(network.clone());
+
+        Self {
+            id: network.id.clone(),
+            topic_leaders: Arc::new(topic_leaders),
+            buckets: Arc::new(Mutex::new(Default::default())),
+            commits: Arc::new(commits),
+            write_log: Arc::new(write_log),
+        }
+    }
+
+    fn propagate_writes(&self, messages: HashMap<Key, BTreeSet<(Offset, u64)>>) {
         for (message, writes) in messages {
             self.buckets
                 .lock()
@@ -116,8 +227,6 @@ impl KafkaLogNode {
                 .or_insert_with(LogBucket::new)
                 .insert(writes.into_iter());
         }
-
-        ResponsePayload::PropagateWritesOk
     }
 
     #[instrument(skip(self), ret)]
@@ -134,18 +243,17 @@ impl KafkaLogNode {
         offset
     }
 
-    #[instrument(skip(self), ret)]
-    async fn send(&self, key: Key, message: u64) -> ResponsePayload {
+    async fn send(&self, key: Key, message: u64, rpc: Rpc) -> Offset {
         let node = self.topic_leaders.get_or_insert(&key).await;
-        if node == self.network.id {
+        if node == self.id {
             let offset = self.create_write(key, message).await;
 
-            ResponsePayload::SendOk { offset }
+            offset
         } else {
-            let request = RequestPayload::Send { key, message };
+            let request = SendRequest { key, message };
 
-            match self.rpc.send(node, request).await {
-                Ok(payload) => payload,
+            match rpc.send::<_, SendResponse>("send", node, request).await {
+                Ok(payload) => payload.offset,
                 _ => {
                     panic!("can't handle")
                 }
@@ -153,8 +261,7 @@ impl KafkaLogNode {
         }
     }
 
-    #[instrument(skip(self,), ret)]
-    fn poll(&self, offsets: &HashMap<SmolStr, Offset>) -> ResponsePayload {
+    fn poll(&self, offsets: &HashMap<SmolStr, Offset>) -> HashMap<Key, Vec<Log>> {
         let mut messages = HashMap::new();
 
         let buckets = self.buckets.lock();
@@ -164,115 +271,30 @@ impl KafkaLogNode {
             }
         }
 
-        ResponsePayload::PollOk { messages }
+        messages
     }
 
-    #[instrument(skip(self,), ret)]
-    fn commit_offsets(&self, offsets: HashMap<SmolStr, Offset>) -> ResponsePayload {
+    fn commit_offsets(&self, offsets: HashMap<SmolStr, Offset>) {
         self.commits.commit(offsets.into_iter());
-
-        ResponsePayload::CommitOffsetsOk
     }
 
-    #[instrument(skip(self,), ret)]
-    fn list_committed_offsets(&self, keys: &[SmolStr]) -> ResponsePayload {
-        ResponsePayload::ListCommittedOffsetsOk {
-            offsets: self.commits.list_commits(keys),
-        }
+    fn list_committed_offsets(&self, keys: &[SmolStr]) -> HashMap<Key, Offset> {
+        self.commits.list_commits(keys)
     }
 
     #[instrument(skip(self))]
-    async fn init_propagate_writes(&self) {
-        let messages = self.write_log.propagate_writes(self.rpc.clone()).await;
+    async fn init_propagate_writes(&self, rpc: &Rpc) {
+        let messages = self.write_log.propagate_writes(rpc.clone()).await;
         let mut buckets = self.buckets.lock();
         for (key, logs) in messages {
             buckets.get_mut(&key).expect("not possible").insert(logs);
         }
     }
 
-    #[instrument(skip(self))]
     fn acknowledge_writes(&self, offsets: HashMap<Key, Offset>) {
         let buckets = self.buckets.lock();
         for (key, offset) in offsets {
             buckets.get(&key).expect("not possible").set_offset(offset);
         }
-    }
-}
-
-impl Node for KafkaLogNode {
-    type Injected = Injected;
-    type Request = RequestPayload;
-
-    fn from_init(
-        network: Arc<Network>,
-        tx: mpsc::Sender<Event<Self::Request, Self::Injected>>,
-        rpc: Rpc,
-    ) -> eyre::Result<Self> {
-        setup_with_telemetry(format!("kafka-{}", network.id))?;
-
-        periodic_injection(
-            tx.clone(),
-            Duration::from_millis(500),
-            Injected::GossipCommits,
-        );
-        periodic_injection(tx, Duration::from_millis(1000), Injected::PropagateWrites);
-
-        let topic_leaders = TopicLeaders::simple(network.clone());
-        let commits = CommitTable::new(network.clone());
-        let write_log = WriteLog::new(network.clone());
-
-        Ok(Self {
-            topic_leaders: Arc::new(topic_leaders),
-            buckets: Arc::new(Mutex::new(Default::default())),
-            commits: Arc::new(commits),
-            write_log: Arc::new(write_log),
-            network,
-            rpc,
-        })
-    }
-
-    #[instrument(skip(self), err)]
-    async fn process_event(
-        &mut self,
-        event: Event<Self::Request, Self::Injected>,
-    ) -> eyre::Result<()> {
-        match event {
-            Event::Injected(Injected::GossipCommits) => {
-                self.commits.clone().gossip_commits(&self.rpc);
-            }
-            Event::Injected(Injected::PropagateWrites) => {
-                self.init_propagate_writes().await;
-            }
-            Event::EOF => {}
-            Event::Request {
-                src,
-                message_id,
-                payload,
-            } => {
-                let payload = match payload {
-                    RequestPayload::Send { ref key, message } => {
-                        self.send(key.clone(), message).await
-                    }
-                    RequestPayload::Poll { ref offsets } => self.poll(offsets),
-                    RequestPayload::CommitOffsets { offsets } => self.commit_offsets(offsets),
-                    RequestPayload::ListCommittedOffsets { ref keys } => {
-                        self.list_committed_offsets(keys)
-                    }
-                    RequestPayload::GossipCommits { commits } => {
-                        self.commits.accept_gossip_commits(&src, commits);
-                        ResponsePayload::GossipCommitsOk
-                    }
-                    RequestPayload::PropagateWrites { messages } => self.propagate_writes(messages),
-                    RequestPayload::AcknowledgeWrites { offsets, .. } => {
-                        self.acknowledge_writes(offsets);
-                        ResponsePayload::AcknowledgeWritesOk
-                    }
-                };
-
-                self.rpc.respond(src, message_id, payload);
-            }
-        }
-
-        Ok(())
     }
 }

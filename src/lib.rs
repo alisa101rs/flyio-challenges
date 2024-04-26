@@ -1,165 +1,88 @@
-#![feature(async_fn_in_trait)]
-
-pub mod event;
+mod init;
 mod mailbox;
+mod message;
 pub mod network;
-mod node;
 mod output;
-mod routing;
+pub mod request;
+pub mod response;
+pub mod routing;
 mod rpc;
 pub mod storage;
 pub mod trace;
+mod util;
 
-use std::io::stdin;
-
-use eyre::Result;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use smol_str::SmolStr;
+use futures::Stream;
+use futures_util::StreamExt;
+use message::{Message, RequestPayload};
+use serde_json::json;
+use tower::ServiceExt;
+use tracing::{info_span, instrument, Instrument};
 
 pub use self::{
+    init::setup_network,
     mailbox::{launch_mailbox_loop, Mailbox},
     network::NodeId,
-    node::{event_loop, periodic_injection, Node},
-    output::Output,
     rpc::Rpc,
 };
+use crate::{
+    request::Request,
+    response::{IntoResponse, Response},
+    routing::Router,
+    trace::inject_parent,
+};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Message<Body> {
-    pub id: u64,
-    pub src: SmolStr,
-    #[serde(default, rename = "dest")]
-    pub dst: SmolStr,
-    pub body: Body,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Request {
-    #[serde(rename = "msg_id")]
-    pub message_id: u64,
-    #[serde(flatten)]
-    pub payload: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Response {
-    pub in_reply_to: u64,
-    #[serde(flatten)]
-    pub payload: Value,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum RequestOrResponse {
-    Request(Request),
-    Response(Response),
-}
-
-impl Message<Request> {
-    pub fn into_reply<F, E>(self, f: F) -> Result<Message<Response>, E>
-    where
-        F: FnOnce(Value) -> Result<Value, E>,
-    {
-        let Message {
-            id, src, dst, body, ..
-        } = self;
-        let Request {
-            message_id,
-            payload,
-            ..
-        } = body;
-
-        Ok(Message {
-            id,
-            src: dst,
-            dst: src,
-            body: Response {
-                in_reply_to: message_id,
-                payload: f(payload)?,
-            },
-        })
+#[instrument(skip(router, rpc, messages), err)]
+pub async fn serve(
+    router: Router,
+    rpc: Rpc,
+    mut messages: impl Stream<Item = Message<RequestPayload>> + Unpin,
+) -> eyre::Result<()> {
+    while let Some(message) = messages.next().await {
+        tokio::spawn(handle(message, router.clone(), rpc.clone()));
     }
+
+    Ok(())
 }
 
-impl Message<Response> {
-    pub fn try_map_payload<F, E>(self, f: F) -> Result<Message<Response>, E>
-    where
-        F: FnOnce(Value) -> Result<Value, E>,
-    {
-        let Message {
-            id, src, dst, body, ..
-        } = self;
-        let Response {
-            in_reply_to,
-            payload,
-        } = body;
+async fn handle(
+    mut message: Message<RequestPayload>,
+    router: Router,
+    rpc: Rpc,
+) -> eyre::Result<()> {
+    let span = info_span!(
+        "Incoming request",
+        otel.name=%message.body.ty,
+        otel.kind="server",
+        r#type=%message.body.ty,
+        from = %message.src,
+        message_id = %message.body.message_id
+    );
+    inject_parent(&span, message.body.traceparent.take());
 
-        Ok(Message {
-            id,
-            src: dst,
-            dst: src,
-            body: Response {
-                in_reply_to,
-                payload: f(payload)?,
-            },
-        })
+    async {
+        let request = Request::from_message(&message);
+        let response = router
+            .oneshot(request)
+            .await
+            .map_err(|it| Response::Error(json!({"error": it.to_string() })))
+            .into_response();
+        match response {
+            Response::None => {}
+            Response::Message(m) => {
+                rpc.respond(
+                    message.src,
+                    message.body.response_type(),
+                    message.body.message_id,
+                    m,
+                );
+            }
+            Response::Error(e) => {
+                rpc.respond(message.src, "error".to_string(), message.body.message_id, e);
+            }
+        }
     }
-}
+    .instrument(span)
+    .await;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum InitRequestPayload {
-    Init {
-        node_id: SmolStr,
-        node_ids: Vec<SmolStr>,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum InitResponsePayload {
-    InitOk,
-}
-
-fn initialize() -> Result<(SmolStr, Vec<SmolStr>)> {
-    let mut init = String::new();
-    stdin().read_line(&mut init)?;
-
-    let message: Message<Request> = serde_json::de::from_str(&init)?;
-
-    tracing::debug!(?message, "Initialize message");
-
-    let Message {
-        id,
-        body: Request {
-            message_id,
-            payload,
-            ..
-        },
-        src,
-        ..
-    } = message;
-
-    let payload: InitRequestPayload = serde_json::value::from_value(payload)?;
-
-    let selv = match payload {
-        InitRequestPayload::Init { node_id, node_ids } => (node_id, node_ids),
-    };
-    let response = Message {
-        id,
-        dst: src,
-        src: selv.0.clone(),
-        body: Response {
-            in_reply_to: message_id,
-            payload: serde_json::to_value(InitResponsePayload::InitOk)?,
-        },
-    };
-    Output::lock().write(Some(response));
-
-    tracing::info!(node = ?selv, "Node initialized");
-
-    Ok(selv)
+    Ok(())
 }

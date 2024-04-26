@@ -1,25 +1,20 @@
-#![feature(async_fn_in_trait)]
-#![feature(integer_atomics)]
-
 use std::{sync::Arc, time::Duration};
 
 use derive_more::Display;
 use flyio_rs::{
-    event::Event,
-    event_loop,
     network::Network,
-    periodic_injection,
-    storage::{
-        vector,
-        vector::{DashVector, Storage, Transaction},
-    },
+    request::{Extension, Payload},
+    response::{IntoResponse, Response},
+    routing::Router,
+    serve, setup_network,
+    storage::vector::{DashVector, Storage, Transaction},
     trace::setup_with_telemetry,
-    Node, Rpc,
+    Rpc,
 };
 use futures::StreamExt;
 use rand::random;
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::Sender;
+use serde::{de::IgnoredAny, Deserialize, Serialize};
+use thiserror::Error;
 use tracing::instrument;
 
 use crate::clock::{Clock, NodeClock};
@@ -43,7 +38,23 @@ impl TransactionId {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    event_loop::<TxnNode, RequestPayload>(None).await?;
+    let (network, rpc, messages) = setup_network().await?;
+    setup_with_telemetry(format!("txn-{}", network.id))?;
+    let node = TxnNode::create(network.clone());
+
+    let router = Router::new()
+        .route("txn", transaction)
+        .route("broadcast", broadcast)
+        .route("tick", tick)
+        .route("ping", ping)
+        .layer(Extension(node.clone()))
+        .layer(Extension(network.clone()))
+        .layer(Extension(rpc.clone()));
+
+    tokio::spawn(start_ticking(node.clone(), rpc.clone(), network.clone()));
+    tokio::spawn(start_processing_commits(node, rpc.clone()));
+
+    serve(router, rpc, messages).await?;
 
     Ok(())
 }
@@ -51,34 +62,103 @@ async fn main() -> eyre::Result<()> {
 #[derive(Clone)]
 pub struct TxnNode {
     clock: NodeClock,
-    network: Arc<Network>,
-    storage: vector::DashVector<u64, u64>,
-    rpc: Rpc,
+    storage: DashVector<u64, u64>,
+}
+
+impl TxnNode {
+    fn create(network: Arc<Network>) -> Self {
+        let storage = DashVector::new();
+
+        Self {
+            clock: NodeClock::new(network.id.clone()),
+            storage,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum RequestPayload {
-    Txn { txn: Vec<Operation> },
-    //Broadcast { ops: Vec<Transaction> },
-    Tick { clock: Clock },
-    Ping,
+struct TransactionRequest {
+    txn: Vec<Operation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponsePayload {
-    TxnOk { txn: Vec<OperationResult> },
-    Error { code: ErrorCode, text: String },
-    BroadcastOk,
-    Tock,
-    Pong,
+struct TransactionResponse {
+    txn: Vec<OperationResult>,
+}
+
+async fn transaction(
+    Extension(mut node): Extension<TxnNode>,
+    Payload(transaction): Payload<TransactionRequest>,
+) -> Result<impl IntoResponse, Error> {
+    let txn = node
+        .transaction(transaction.txn)
+        .await
+        .map_err(|er| Error {
+            code: ErrorCode::TxnConflict,
+            text: er.to_string(),
+        })?;
+
+    Ok(Payload(TransactionResponse { txn }))
+}
+
+async fn broadcast() {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Tick {
+    clock: Clock,
+}
+
+async fn tick(Extension(node): Extension<TxnNode>, Payload(tick): Payload<Tick>) {
+    node.clock.merge(&tick.clock);
+}
+
+async fn ping() {}
+
+async fn start_ticking(node: TxnNode, rpc: Rpc, network: Arc<Network>) {
+    #[instrument(skip(node, rpc, network))]
+    async fn do_tick(node: &TxnNode, rpc: &Rpc, network: &Network) {
+        let clock = node.clock.next();
+
+        let mut iter = rpc.broadcast::<_, IgnoredAny>("tick", network, Tick { clock });
+
+        while let Some(_m) = iter.next().await {
+            tracing::info!("Received Tock")
+        }
+    }
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        ticker.tick().await;
+
+        do_tick(&node, &rpc, &network).await;
+    }
+}
+
+async fn start_processing_commits(node: TxnNode, _rpc: Rpc) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(400));
+    loop {
+        ticker.tick().await;
+        node.process_commits().await;
+    }
+}
+
+#[derive(Debug, Clone, Error, Serialize, Deserialize)]
+#[error("Error")]
+struct Error {
+    code: ErrorCode,
+    text: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Copy, Clone)]
 #[repr(u8)]
 pub enum ErrorCode {
     TxnConflict = 30,
+}
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        Response::Error(serde_json::to_value(self).unwrap())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,12 +207,6 @@ pub enum OpType {
     Write,
 }
 
-#[derive(Debug, Clone)]
-pub enum Injected {
-    ProcessCommits,
-    Tick,
-}
-
 impl TxnNode {
     #[instrument(skip(self,), ret, err)]
     pub async fn transaction(
@@ -162,80 +236,7 @@ impl TxnNode {
     }
 
     #[instrument(skip(self,))]
-    pub async fn process_commits(&mut self) {
+    pub async fn process_commits(&self) {
         //
-    }
-}
-
-impl Node for TxnNode {
-    type Injected = Injected;
-    type Request = RequestPayload;
-
-    fn from_init(
-        network: Arc<Network>,
-        tx: Sender<Event<Self::Request, Self::Injected>>,
-        rpc: Rpc,
-    ) -> eyre::Result<Self> {
-        setup_with_telemetry(format!("txn-{}", network.id))?;
-        periodic_injection(tx.clone(), Duration::from_millis(10), Injected::Tick);
-        periodic_injection(tx, Duration::from_millis(400), Injected::ProcessCommits);
-
-        let storage = DashVector::new();
-
-        Ok(Self {
-            clock: NodeClock::new(network.id.clone()),
-            network,
-            storage,
-            rpc,
-        })
-    }
-
-    #[instrument(skip(self), err)]
-    async fn process_event(
-        &mut self,
-        event: Event<Self::Request, Self::Injected>,
-    ) -> eyre::Result<()> {
-        match event {
-            Event::Request {
-                src,
-                message_id,
-                payload,
-            } => {
-                let payload = match payload {
-                    RequestPayload::Txn { txn } => match self.transaction(txn).await {
-                        Ok(txn) => ResponsePayload::TxnOk { txn },
-                        Err(er) => ResponsePayload::Error {
-                            code: ErrorCode::TxnConflict,
-                            text: er.to_string(),
-                        },
-                    },
-                    RequestPayload::Ping => ResponsePayload::Pong,
-                    //RequestPayload::Broadcast { .. } => ResponsePayload::Pong,
-                    RequestPayload::Tick { clock } => {
-                        self.clock.merge(&clock);
-                        ResponsePayload::Tock
-                    }
-                };
-
-                self.rpc.respond(src, message_id, payload);
-            }
-            Event::Injected(Injected::ProcessCommits) => {
-                self.process_commits().await;
-            }
-            Event::Injected(Injected::Tick) => {
-                let clock = self.clock.next();
-
-                let mut iter = self
-                    .rpc
-                    .broadcast::<_, ResponsePayload>(&self.network, RequestPayload::Tick { clock });
-
-                while let Some(_m) = iter.next().await {
-                    tracing::info!("Received Tock")
-                }
-            }
-            Event::EOF => {}
-        }
-
-        Ok(())
     }
 }
