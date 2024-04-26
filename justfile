@@ -29,8 +29,8 @@ echo:
     ./maelstrom test -w echo --bin ./target/debug/echo --node-count 1 --time-limit 10
 
 unique_id:
-    cargo build --bin unique_id
-    ./maelstrom test -w unique-ids --bin ./target/debug/unique_id --time-limit 30 --rate 2000 --node-count 5 --availability total --nemesis partition
+    cargo build --release --bin unique_id
+    ./maelstrom test -w unique-ids --bin ./target/release/unique_id --time-limit 30 --rate 10000 --concurrency 3n --node-count 5 --availability total --nemesis partition
 
 broadcast-3a:
     cargo build --bin broadcast
@@ -90,15 +90,15 @@ txn-rw-6a:
 
 txn-rw-6b:
     cargo build --bin txn-rw
-    ./maelstrom test -w txn-rw-register --bin ./target/debug/txn-rw --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total
+    ./maelstrom test -w txn-rw-register --bin ./target/debug/txn-rw --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total --nemesis partition
 
 txn-rw-6c:
     cargo build --bin txn-rw
-    ./maelstrom test -w txn-rw-register --bin ./target/debug/txn-rw --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-committed --availability total
+    ./maelstrom test -w txn-rw-register --bin ./target/debug/txn-rw --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-committed --availability total --nemesis partition
 
 txn-rw-6d:
     cargo build --bin txn-rw
-    ./maelstrom test -w txn-rw-register --bin ./target/debug/txn-rw --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models monotonic-view --availability total
+    ./maelstrom test -w txn-rw-register --bin ./target/debug/txn-rw --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models monotonic-view --availability total --nemesis partition
 
 
 
