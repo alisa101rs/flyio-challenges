@@ -1,4 +1,4 @@
-use std::{collections::Bound, ops::RangeBounds};
+use std::{collections::BTreeMap, ops::RangeBounds};
 
 pub trait Storage<V: Clone> {
     fn append(&mut self, value: V) -> u64;
@@ -11,37 +11,18 @@ pub trait Storage<V: Clone> {
 
 #[derive(Debug, Default)]
 pub struct Memory<V> {
-    log: Vec<V>,
+    log: BTreeMap<u64, V>,
     committed: Option<u64>,
 }
 
 impl<V: Clone> Storage<V> for Memory<V> {
     fn append(&mut self, value: V) -> u64 {
-        self.log.push(value);
+        self.log.insert(self.log.len() as _, value);
         self.log.len() as _
     }
 
     fn scan<'a>(&'a self, range: impl RangeBounds<u64>) -> Box<dyn Iterator<Item = (u64, V)> + 'a> {
-        let start = match range.start_bound() {
-            Bound::Included(s) => *s as usize,
-            Bound::Excluded(s) => *s as usize + 1,
-            Bound::Unbounded => 0,
-        };
-
-        let items = match range.end_bound() {
-            Bound::Included(e) => (*e as usize) - start,
-            Bound::Excluded(e) => (*e as usize - 1) - start,
-            Bound::Unbounded => usize::MAX,
-        };
-
-        Box::new(
-            self.log
-                .iter()
-                .enumerate()
-                .map(|(k, v)| (k as u64, v.clone()))
-                .skip(start)
-                .take(items),
-        )
+        Box::new(self.log.range(range).map(|(k, v)| (*k, v.clone())))
     }
 
     fn commit(&mut self, index: u64) {
@@ -59,7 +40,7 @@ impl<V: Clone> Storage<V> for Memory<V> {
             assert!(index > commit);
         }
 
-        self.log.drain((index as usize)..);
+        let _ = self.log.split_off(&index);
     }
 
     fn len(&self) -> u64 {

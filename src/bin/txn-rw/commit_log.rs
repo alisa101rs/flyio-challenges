@@ -1,53 +1,109 @@
-use std::{collections::VecDeque, sync::Arc, time::Instant};
+use std::{future::ready, sync::Arc, time::Duration};
 
-use flyio_rs::{network::Network, Rpc};
-use parking_lot::Mutex;
+use flyio_rs::{
+    network::Network,
+    request::{Extension, Payload},
+    response::IntoResponse,
+    storage::{
+        log,
+        log::Storage as _,
+        vector::{Storage as _, Transaction},
+    },
+    Rpc,
+};
+use futures::Stream;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use tokio::{select, sync::mpsc};
 use tracing::instrument;
 
-use crate::TransactionId;
+use crate::{clock::Clock, Operation};
 
-#[derive(Clone)]
-pub struct CommitLog {
+pub type ReplicationItem = (Clock, Vec<Operation>);
+pub type OperationReplication = mpsc::UnboundedSender<ReplicationItem>;
+
+pub fn setup_replication(
+    storage: log::Memory<ReplicationItem>,
+    rpc: Rpc,
     network: Arc<Network>,
-    queue: Arc<Mutex<VecDeque<Transaction>>>,
+) -> OperationReplication {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(replication_loop(
+        tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        storage,
+        rpc,
+        network,
+    ));
+
+    tx
 }
 
-impl CommitLog {
-    pub fn new(network: Arc<Network>) -> Self {
-        Self {
-            network,
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+async fn replication_loop(
+    mut items: impl Stream<Item = ReplicationItem> + Unpin,
+    mut storage: log::Memory<ReplicationItem>,
+    rpc: Rpc,
+    network: Arc<Network>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        select! {
+            Some(item) = items.next() => {
+                storage.append(item);
+            }
+            _ = ticker.tick() => {
+                replicate_writes(&mut storage, &rpc, &network).await;
+            }
         }
     }
+}
 
-    pub fn transaction(&self, operations: Vec<(u64, u64)>) -> eyre::Result<()> {
-        let id = TransactionId::new();
-        let at = Instant::now();
+#[instrument(skip(storage, rpc, network))]
+async fn replicate_writes(
+    storage: &mut log::Memory<ReplicationItem>,
+    rpc: &Rpc,
+    network: &Network,
+) {
+    let commit = storage.last_committed().unwrap_or(0);
+    let ops = storage.scan(commit..).map(|(_, it)| it).collect::<Vec<_>>();
 
-        self.queue
-            .lock()
-            .push_back(Transaction { id, at, operations });
+    let broadcast =
+        rpc.broadcast::<_, ReplicationResponse>("replicate", &network, ReplicationRequest { ops });
 
-        Ok(())
-    }
+    let c = broadcast.filter(|it| ready(it.is_ok())).count().await;
 
-    #[instrument(skip(self, storage, rpc))]
-    pub async fn process(&self, storage: &Storage, rpc: &Rpc) {
-        // let batch = {
-        //     let mut queue = self.queue.lock();
-        //     queue.drain(..).collect::<Vec<_>>()
-        // };
-        // //let message = RequestPayload::Broadcast { ops: batch };
-        //
-        // for node in self.network.other_nodes() {}
-
-        todo!()
+    if network.peer_count() == c {
+        storage.commit(commit);
+        tracing::info!(%commit, "Successfully replicated writes")
+    } else {
+        tracing::warn!(%commit, "Failed to replicate writes")
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Transaction {
-    id: TransactionId,
-    at: Instant,
-    operations: Vec<(u64, u64)>,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReplicationRequest {
+    ops: Vec<ReplicationItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReplicationResponse {
+    items: usize,
+}
+
+#[instrument(name = "replicate", skip(storage), ret)]
+pub async fn handler(
+    Extension(storage): Extension<super::Storage>,
+    Payload(replication): Payload<ReplicationRequest>,
+) -> impl IntoResponse {
+    let items = replication.ops.len();
+    for (at, ops) in replication.ops {
+        let mut ops = ops.into_iter();
+        let mut transact = storage.begin(at);
+        while let Some(Operation::Write { key, value }) = ops.next() {
+            transact.write(key, value);
+        }
+        transact.commit();
+    }
+
+    Payload(ReplicationResponse { items })
 }

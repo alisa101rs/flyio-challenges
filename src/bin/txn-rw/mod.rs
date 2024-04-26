@@ -1,146 +1,53 @@
-use std::{sync::Arc, time::Duration};
-
-use derive_more::Display;
 use flyio_rs::{
-    network::Network,
-    request::{Extension, Payload},
+    request::Extension,
     response::{IntoResponse, Response},
     routing::Router,
     serve, setup_network,
-    storage::vector::{DashVector, Storage, Transaction},
+    storage::{log, vector::DashVector},
     trace::setup_with_telemetry,
-    Rpc,
 };
-use futures::StreamExt;
-use rand::random;
-use serde::{de::IgnoredAny, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::instrument;
 
 use crate::clock::{Clock, NodeClock};
 
 mod clock;
-// mod commit_log;
-//
+mod commit_log;
+mod transaction;
 // mod write_log;
 
-#[derive(
-    Copy, Clone, Debug, Display, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct TransactionId(u128);
-
-impl TransactionId {
-    pub fn new() -> TransactionId {
-        TransactionId(random())
-    }
-}
+pub type Storage = DashVector<u64, u64>;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let (network, rpc, messages) = setup_network().await?;
     setup_with_telemetry(format!("txn-{}", network.id))?;
-    let node = TxnNode::create(network.clone());
+
+    let clock = NodeClock::new(network.id.clone());
+    let storage = DashVector::<u64, u64>::new();
+    let logs = log::Memory::<(Clock, Vec<Operation>)>::default();
+
+    let replication = commit_log::setup_replication(logs, rpc.clone(), network.clone());
 
     let router = Router::new()
-        .route("txn", transaction)
-        .route("broadcast", broadcast)
-        .route("tick", tick)
+        .route("txn", transaction::handler)
+        .route("tick", clock::handler)
         .route("ping", ping)
-        .layer(Extension(node.clone()))
+        .route("replicate", commit_log::handler)
+        .layer(Extension(clock.clone()))
         .layer(Extension(network.clone()))
+        .layer(Extension(storage.clone()))
+        .layer(Extension(replication))
         .layer(Extension(rpc.clone()));
 
-    tokio::spawn(start_ticking(node.clone(), rpc.clone(), network.clone()));
-    tokio::spawn(start_processing_commits(node, rpc.clone()));
+    tokio::spawn(clock::start_ticking(clock.clone(), rpc.clone(), network));
 
     serve(router, rpc, messages).await?;
 
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct TxnNode {
-    clock: NodeClock,
-    storage: DashVector<u64, u64>,
-}
-
-impl TxnNode {
-    fn create(network: Arc<Network>) -> Self {
-        let storage = DashVector::new();
-
-        Self {
-            clock: NodeClock::new(network.id.clone()),
-            storage,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransactionRequest {
-    txn: Vec<Operation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TransactionResponse {
-    txn: Vec<OperationResult>,
-}
-
-async fn transaction(
-    Extension(mut node): Extension<TxnNode>,
-    Payload(transaction): Payload<TransactionRequest>,
-) -> Result<impl IntoResponse, Error> {
-    let txn = node
-        .transaction(transaction.txn)
-        .await
-        .map_err(|er| Error {
-            code: ErrorCode::TxnConflict,
-            text: er.to_string(),
-        })?;
-
-    Ok(Payload(TransactionResponse { txn }))
-}
-
-async fn broadcast() {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Tick {
-    clock: Clock,
-}
-
-async fn tick(Extension(node): Extension<TxnNode>, Payload(tick): Payload<Tick>) {
-    node.clock.merge(&tick.clock);
-}
-
 async fn ping() {}
-
-async fn start_ticking(node: TxnNode, rpc: Rpc, network: Arc<Network>) {
-    #[instrument(skip(node, rpc, network))]
-    async fn do_tick(node: &TxnNode, rpc: &Rpc, network: &Network) {
-        let clock = node.clock.next();
-
-        let mut iter = rpc.broadcast::<_, IgnoredAny>("tick", network, Tick { clock });
-
-        while let Some(_m) = iter.next().await {
-            tracing::info!("Received Tock")
-        }
-    }
-
-    let mut ticker = tokio::time::interval(Duration::from_millis(10));
-    loop {
-        ticker.tick().await;
-
-        do_tick(&node, &rpc, &network).await;
-    }
-}
-
-async fn start_processing_commits(node: TxnNode, _rpc: Rpc) {
-    let mut ticker = tokio::time::interval(Duration::from_millis(400));
-    loop {
-        ticker.tick().await;
-        node.process_commits().await;
-    }
-}
 
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
 #[error("Error")]
@@ -162,7 +69,7 @@ impl IntoResponse for Error {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "RawOp")]
+#[serde(from = "RawOp", into = "RawOp")]
 pub enum Operation {
     Read { key: u64 },
     Write { key: u64, value: u64 },
@@ -187,6 +94,15 @@ impl From<RawOp> for Operation {
     }
 }
 
+impl Into<RawOp> for Operation {
+    fn into(self) -> RawOp {
+        match self {
+            Operation::Read { .. } => unimplemented!(),
+            Operation::Write { key, value } => RawOp(OpType::Write, key, Some(value)),
+        }
+    }
+}
+
 impl From<OperationResult> for RawOp {
     fn from(val: OperationResult) -> Self {
         match val {
@@ -205,38 +121,4 @@ pub enum OpType {
     Read,
     #[serde(rename = "w")]
     Write,
-}
-
-impl TxnNode {
-    #[instrument(skip(self,), ret, err)]
-    pub async fn transaction(
-        &mut self,
-        ops: Vec<Operation>,
-    ) -> Result<Vec<OperationResult>, eyre::Report> {
-        let mut transaction = self.storage.begin(self.clock.next());
-        let mut res = vec![];
-
-        for op in ops {
-            match op {
-                Operation::Read { key } => res.push(OperationResult::Read {
-                    key,
-                    value: transaction.read(&key),
-                }),
-                Operation::Write { key, value } => {
-                    transaction.write(key, value);
-                    res.push(OperationResult::Write { key, value })
-                }
-            }
-        }
-
-        transaction.commit();
-        //self.commit_log.transaction(writes)?;
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self,))]
-    pub async fn process_commits(&self) {
-        //
-    }
 }
