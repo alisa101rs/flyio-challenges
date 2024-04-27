@@ -1,7 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    hash::{Hash, Hasher},
-    ops,
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -10,6 +8,7 @@ use std::{
 };
 
 use flyio_rs::{
+    network::Network,
     request::{Extension, Payload},
     response::IntoResponse,
     routing::Router,
@@ -17,273 +16,156 @@ use flyio_rs::{
     trace::setup_with_telemetry,
     NodeId, Rpc,
 };
-use futures::{stream::FuturesUnordered, StreamExt};
-use parking_lot::Mutex;
+use futures::StreamExt;
 use serde::{de::IgnoredAny, Deserialize, Serialize};
-use smol_str::SmolStr;
-use tracing::{instrument, Instrument};
-
-#[derive(Debug, Clone, Deserialize)]
-struct Add {
-    delta: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Replicate {
-    deltas: Vec<Delta>,
-    last_commit: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ReadResponse {
-    value: u64,
-}
-
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Identifier {
-    src: u64,
-    id: u64,
-}
-
-impl Identifier {
-    pub fn new(src: u64, id: u64) -> Self {
-        Self { src, id }
-    }
-}
-
-#[derive(Debug, Copy, Clone, Deserialize, Serialize)]
-pub struct Delta {
-    id: Identifier,
-    value: u64,
-}
-
-impl Delta {
-    pub fn new(value: u64, id: Identifier) -> Self {
-        Self { value, id }
-    }
-}
-
-impl ops::Add<Delta> for Delta {
-    type Output = u64;
-
-    fn add(self, rhs: Delta) -> Self::Output {
-        self.value + rhs.value
-    }
-}
-
-impl PartialEq for Delta {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl PartialOrd for Delta {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.id.partial_cmp(&other.id)
-    }
-}
-
-impl Ord for Delta {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id.cmp(&other.id)
-    }
-}
-
-impl Eq for Delta {}
-
-impl Hash for Delta {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
+use tracing::instrument;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let (network, rpc, messages) = setup_network().await?;
     setup_with_telemetry(format!("counter-{}", network.id))?;
-    let counter = GrowCounter::create(&network.id, &network.other_nodes());
+    let counter = Counters::create(&network.id, &network.other_nodes());
 
     let router = Router::new()
         .route("add", add)
         .route("read", read)
         .route("replicate", replicate)
         .layer(Extension(counter.clone()))
-        .layer(Extension(network))
         .layer(Extension(rpc.clone()));
 
-    tokio::spawn(start_replication(counter.clone(), rpc.clone()));
-    tokio::spawn(compress(counter));
+    tokio::spawn(start_replication(
+        counter.clone(),
+        rpc.clone(),
+        network.clone(),
+    ));
 
     serve(router, rpc, messages).await?;
 
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReadResponse {
+    value: i64,
+}
+
 #[instrument(skip(counter), ret)]
-async fn read(Extension(counter): Extension<GrowCounter>) -> impl IntoResponse {
+async fn read(Extension(counter): Extension<Counters>) -> impl IntoResponse {
     Payload(ReadResponse {
-        value: counter.read(),
+        value: (counter.positive.read() as i64) - counter.negative.read() as i64,
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Replicate {
+    positive: Vec<(NodeId, u64)>,
+    negative: Vec<(NodeId, u64)>,
 }
 #[instrument(skip(counter))]
 async fn replicate(
-    src: NodeId,
-    Extension(counter): Extension<GrowCounter>,
+    Extension(counter): Extension<Counters>,
     Payload(replicate): Payload<Replicate>,
 ) {
-    let mut my_deltas = counter.deltas.lock();
-    let last_replicate =
-        counter.replications[&src].fetch_max(replicate.last_commit, Ordering::Relaxed);
+    counter.positive.merge(replicate.positive);
+    counter.negative.merge(replicate.negative);
+}
 
-    my_deltas.extend(
-        replicate
-            .deltas
-            .iter()
-            .filter(|it| it.id.id > last_replicate),
-    );
+#[derive(Debug, Clone, Deserialize)]
+struct Add {
+    delta: i64,
 }
 
 #[instrument(skip(counter))]
-async fn add(Extension(counter): Extension<GrowCounter>, Payload(add): Payload<Add>) {
-    if add.delta != 0 {
-        counter.add(add.delta);
+async fn add(Extension(counter): Extension<Counters>, Payload(add): Payload<Add>) {
+    if add.delta > 0 {
+        counter.positive.add(add.delta as u64);
+    }
+    if add.delta < 0 {
+        counter.negative.add(add.delta.abs() as _)
     }
 }
 
-async fn start_replication(counter: GrowCounter, rpc: Rpc) {
+async fn start_replication(counter: Counters, rpc: Rpc, network: Arc<Network>) {
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     loop {
         ticker.tick().await;
-        send_replication(&counter, &rpc).await;
-    }
-}
-
-async fn compress(counter: GrowCounter) {
-    let mut ticker = tokio::time::interval(Duration::from_millis(1000));
-    loop {
-        ticker.tick().await;
-        counter.compress();
+        send_replication(&counter, &rpc, &network).await;
     }
 }
 
 #[instrument(skip(counter, rpc))]
-async fn send_replication(counter: &GrowCounter, rpc: &Rpc) {
-    let mut futures = FuturesUnordered::new();
-    for (node, last_commit) in &*counter.commits {
-        let last_commit_from_n = last_commit.load(Ordering::Relaxed);
+async fn send_replication(counter: &Counters, rpc: &Rpc, network: &Network) {
+    let positive = counter.positive.serialize();
+    let negative = counter.negative.serialize();
+    let _ = rpc
+        .broadcast::<_, IgnoredAny>("replicate", network, Replicate { positive, negative })
+        .count()
+        .await;
+}
 
-        let deltas: Vec<_> = {
-            let deltas = counter.deltas.lock();
+#[derive(Debug, Clone)]
+struct Counters {
+    positive: GrowCounter,
+    negative: GrowCounter,
+}
 
-            deltas
-                .iter()
-                .filter(|&it| it.id.src == counter.myself && it.id.id > last_commit_from_n)
-                .cloned()
-                .collect()
-        };
-        if deltas.is_empty() {
-            continue;
-        }
-        let last_commit = deltas.iter().max().unwrap().id.id;
-        let span = tracing::info_span!(
-            "Replication",
-            ?last_commit_from_n,
-            ?last_commit,
-            ?deltas,
-            ?node,
-        );
-        let dst = node.clone();
-        let payload = Replicate {
-            deltas,
-            last_commit,
-        };
-
-        let send = rpc
-            .send::<_, IgnoredAny>("replicate", dst.clone(), payload)
-            .instrument(span);
-        futures.push(async move {
-            match send.await {
-                Ok(_) => Some((dst, last_commit)),
-                _ => None,
-            }
-        });
-    }
-
-    while let Some(response) = futures.next().await {
-        if let Some((src, last_commit)) = response {
-            counter
-                .commits
-                .get(&src)
-                .unwrap()
-                .fetch_max(last_commit, Ordering::Relaxed);
+impl Counters {
+    fn create(id: &NodeId, peers: &[NodeId]) -> Self {
+        Self {
+            positive: GrowCounter::create(id, peers),
+            negative: GrowCounter::create(id, peers),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct GrowCounter {
-    myself: u64,
-    ids: Arc<AtomicU64>,
-    deltas: Arc<Mutex<HashSet<Delta>>>,
-    commits: Arc<HashMap<SmolStr, AtomicU64>>,
-    replications: Arc<HashMap<SmolStr, AtomicU64>>,
+    id: NodeId,
+    values: Arc<HashMap<NodeId, AtomicU64>>,
 }
 
 impl GrowCounter {
     fn create(id: &NodeId, peers: &[NodeId]) -> Self {
-        let commits = peers
-            .iter()
-            .map(|it| (it.clone(), AtomicU64::new(0)))
-            .collect();
-
-        let replications = peers
-            .iter()
-            .map(|it| (it.clone(), AtomicU64::new(0)))
-            .collect();
-
-        let myself = id.strip_prefix('n').unwrap().parse::<u64>().unwrap() + 1;
+        let me = [(id.clone(), AtomicU64::new(0))].into_iter();
+        let peers = peers.iter().map(|it| (it.clone(), AtomicU64::new(0)));
+        let values = Arc::new(me.chain(peers).collect());
 
         Self {
-            myself,
-            ids: Arc::new(AtomicU64::new(1)),
-            deltas: Arc::new(Mutex::new(Default::default())),
-            commits: Arc::new(commits),
-            replications: Arc::new(replications),
-        }
-    }
-    fn next_id(&self) -> Identifier {
-        Identifier {
-            src: self.myself,
-            id: self.ids.fetch_add(1, Ordering::Relaxed),
+            id: id.clone(),
+            values,
         }
     }
 
     fn add(&self, delta: u64) {
-        self.deltas.lock().insert(Delta::new(delta, self.next_id()));
+        self.values
+            .get(&self.id)
+            .unwrap()
+            .fetch_add(delta, Ordering::SeqCst);
     }
 
     fn read(&self) -> u64 {
-        self.deltas.lock().iter().map(|it| it.value).sum()
+        self.values
+            .iter()
+            .map(|(_, it)| it.load(Ordering::Relaxed))
+            .sum()
     }
 
-    #[instrument(skip(self))]
-    fn compress(&self) {
-        let last_commit = self
-            .commits
-            .values()
-            .map(|it| it.load(Ordering::Relaxed))
-            .min()
-            .unwrap();
+    fn serialize(&self) -> Vec<(NodeId, u64)> {
+        self.values
+            .iter()
+            .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+            .collect()
+    }
 
-        let mut values = self.deltas.lock();
-
-        let mut compressed = 0;
-        values.retain(|delta| {
-            let should_remove = delta.id.src != self.myself || delta.id.id <= last_commit;
-            compressed += delta.value * should_remove as u64;
-            !should_remove
-        });
-
-        values.insert(Delta::new(compressed, Identifier::new(0, 0)));
+    fn merge(&self, others: impl IntoIterator<Item = (NodeId, u64)>) {
+        for (node, value) in others {
+            if node == self.id {
+                continue;
+            }
+            self.values
+                .get(&node)
+                .unwrap()
+                .fetch_max(value, Ordering::SeqCst);
+        }
     }
 }

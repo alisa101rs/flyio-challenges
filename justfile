@@ -64,6 +64,11 @@ counter-4b:
     cargo build --bin counter --release
     ./maelstrom test -w g-counter --bin ./target/release/counter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
 
+counter-4x:
+    cargo build --bin counter --release
+    ./maelstrom test -w pn-counter --bin ./target/release/counter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+
+
 kafka-5o:
      cargo build --bin kafka
      ./maelstrom test -w kafka --bin ./target/debug/kafka --node-count 1  --concurrency 2n --rate 10 --time-limit 10
