@@ -100,8 +100,9 @@ txn-rw-6d:
     cargo build --bin txn-rw
     ./maelstrom test -w txn-rw-register --bin ./target/debug/txn-rw --node-count 2 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models monotonic-view --availability total --nemesis partition
 
-
-
+gset-a1:
+    cargo build --bin g_set
+    ./maelstrom test -w g-set --bin ./target/debug/g_set --node-count 5 --time-limit 20 --rate 100
 
 serve:
     ./maelstrom serve
