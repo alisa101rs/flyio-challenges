@@ -17,7 +17,7 @@ derive_more = "0.99"
 
 thiserror = "1.0.59"
 eyre = "0.6.8"
-smol_str = { version = "0.1", features = ["serde"] }
+smol_str = { version = "0.2.1", features = ["serde"] }
 rand = "0.8.5"
 async-stream = "0.3.5"
 tokio = { version = "1.37.0", features = ["full"] }
@@ -29,6 +29,7 @@ futures-util = "0.3.30"
 fnv = "1.0.7"
 dashmap = "5.4.0"
 vclock = { version = "0.4.3", features = ["serde"] }
+strum = { version = "0.26.2", features = ["derive"] }
 
 # tracing
 tracing = "0.1.37"
@@ -49,3 +50,7 @@ path = "src/bin/kafka/mod.rs"
 [[bin]]
 name = "txn-rw"
 path = "src/bin/txn-rw/mod.rs"
+
+[[bin]]
+name = "lin-kv"
+path = "src/bin/lin-kv/mod.rs"

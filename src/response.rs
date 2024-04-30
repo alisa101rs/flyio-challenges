@@ -3,7 +3,7 @@ use std::fmt;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::request::Payload;
+use crate::{error, request::Payload};
 
 #[derive(Debug)]
 pub enum Response {
@@ -39,6 +39,12 @@ impl<T: IntoResponse, E: IntoResponse> IntoResponse for Result<T, E> {
 impl IntoResponse for eyre::Report {
     fn into_response(self) -> Response {
         Response::Error(json!({"error": self.to_string() }))
+    }
+}
+
+impl<T: fmt::Debug + Into<error::Error>> IntoResponse for T {
+    fn into_response(self) -> Response {
+        Response::Error(serde_json::to_value(self.into()).unwrap())
     }
 }
 

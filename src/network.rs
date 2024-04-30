@@ -30,7 +30,7 @@ impl Network {
     }
 
     pub fn peer_count(&self) -> usize {
-        self.nodes.read().len()
+        self.nodes.read().len() - 1
     }
 
     pub fn other_nodes(&self) -> Vec<NodeId> {

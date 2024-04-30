@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use derivative::Derivative;
-use eyre::{eyre, Result};
+use eyre::eyre;
 use futures::{stream::FuturesUnordered, Stream};
 use rand::random;
 use serde::{de::DeserializeOwned, Serialize};
@@ -10,6 +10,7 @@ use tracing::instrument;
 
 pub use super::Mailbox;
 use crate::{
+    error::{Error, ErrorCode},
     message::{Message, RequestPayload, ResponsePayload},
     network::Network,
     trace::inject_trace,
@@ -63,7 +64,7 @@ impl Rpc {
         ty: impl Into<SmolStr>,
         network: &Network,
         payload: Req,
-    ) -> impl Stream<Item = Result<(NodeId, Res)>> + Send + Sync + 'a
+    ) -> impl Stream<Item = Result<(NodeId, Res), Error>> + Send + Sync + 'a
     where
         Req: Serialize + Clone + std::fmt::Debug + Sync + Send + 'static,
         Res: DeserializeOwned + std::fmt::Debug + Sync + Send + 'static,
@@ -85,7 +86,7 @@ impl Rpc {
         ty: impl Into<SmolStr> + std::fmt::Debug,
         dst: NodeId,
         payload: Req,
-    ) -> Result<Res>
+    ) -> Result<Res, Error>
     where
         Req: Serialize + std::fmt::Debug,
         Res: DeserializeOwned + std::fmt::Debug,
@@ -99,20 +100,26 @@ impl Rpc {
                 body: RequestPayload {
                     message_id: id,
                     traceparent: None,
-                    payload: serde_json::to_value(payload)?,
+                    payload: serde_json::to_value(payload).unwrap(),
                     ty: ty.into(),
                 },
             })
             .await?;
 
-        serde_json::from_value(response.body.payload).map_err(|er| eyre!("Invalid response {er}"))
+        match response.body.ty.as_str() {
+            "error" => {
+                Err(serde_json::from_value(response.body.payload).expect("Correct error body"))
+            }
+            _ => Ok(serde_json::from_value(response.body.payload)
+                .map_err(|er| ErrorCode::MalformedRequest)?),
+        }
     }
 
     #[instrument(skip(self), err)]
     async fn send_message(
         &self,
         mut req: Message<RequestPayload>,
-    ) -> Result<Message<ResponsePayload>> {
+    ) -> Result<Message<ResponsePayload>, Error> {
         inject_trace(&mut req);
         let rv = self.mailbox.send(req);
 
@@ -120,11 +127,11 @@ impl Rpc {
             Ok(Ok(res)) => Ok(res),
             Ok(Err(er)) => {
                 tracing::error!(?er, "Could not receive response");
-                Err(eyre!("Error: {er:?}"))
+                panic!("")
             }
             Err(timeout) => {
                 tracing::error!("Timeout. Could not receive response in time");
-                Err(eyre!("Timeout: {timeout:?}"))
+                Err(ErrorCode::Timeout)?
             }
         }
     }

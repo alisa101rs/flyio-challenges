@@ -1,5 +1,6 @@
 #!/usr/bin/env just --justfile
 
+set dotenv-load
 
 cargo-fix-all:
     cargo fix --allow-dirty --allow-staged --all
@@ -108,6 +109,15 @@ txn-rw-6d:
 gset-a1:
     cargo build --bin g_set
     ./maelstrom test -w g-set --bin ./target/debug/g_set --node-count 5 --time-limit 20 --rate 100
+
+lin-kv-a2-0:
+    cargo build --bin lin-kv
+    ./maelstrom test -w lin-kv --bin ./target/debug/lin-kv --node-count 1 --time-limit 20 --rate 10 --concurrency 2n
+
+lin-kv-a2-1:
+    cargo build --bin lin-kv
+    ./maelstrom test -w lin-kv --bin ./target/debug/lin-kv --node-count 5 --time-limit 20 --rate 10 --concurrency 2n --consistency-models linearizable
+
 
 serve:
     ./maelstrom serve

@@ -1,3 +1,4 @@
+pub mod error;
 mod init;
 mod mailbox;
 mod message;
@@ -25,6 +26,7 @@ pub use self::{
     rpc::Rpc,
 };
 use crate::{
+    error::ErrorCode,
     request::Request,
     response::{IntoResponse, Response},
     routing::Router,
@@ -64,7 +66,7 @@ async fn handle(
         let response = router
             .oneshot(request)
             .await
-            .map_err(|it| Response::Error(json!({"error": it.to_string() })))
+            .map_err(|it| ErrorCode::Crash)
             .into_response();
         match response {
             Response::None => {}

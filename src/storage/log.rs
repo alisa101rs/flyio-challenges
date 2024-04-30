@@ -9,10 +9,19 @@ pub trait Storage<V: Clone> {
     fn len(&self) -> u64;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Memory<V> {
     log: BTreeMap<u64, V>,
     committed: Option<u64>,
+}
+
+impl<V> Default for Memory<V> {
+    fn default() -> Self {
+        Self {
+            log: BTreeMap::new(),
+            committed: None,
+        }
+    }
 }
 
 impl<V: Clone> Storage<V> for Memory<V> {
